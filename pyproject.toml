@@ -1,0 +1,17 @@
+[project]
+name = "sql"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.123.9",
+    "pydantic>=2.12.5",
+    "pymysql>=1.1.2",
+    "python-dotenv>=1.2.1",
+    "sqlalchemy>=2.0.44",
+    "uvicorn>=0.38.0",
+    "bcrypt>=4.2.0",
+    "requests>=2.32.0",
+    "PyJWT>=2.9.0",
+]
