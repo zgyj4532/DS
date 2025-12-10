@@ -13,5 +13,6 @@ logs/
 # Virtual environments
 .venv
 .env
+数据库表结构优化建议.md
 项目分析与优化建议.md
 assets/
