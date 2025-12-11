@@ -5,10 +5,10 @@ from typing import Optional
 from core.config import UserStatus
 
 
+
 class SetStatusReq(BaseModel):
-    """设置用户状态请求"""
     mobile: str
-    new_status: UserStatus = Field(..., description="0-正常 1-冻结 2-注销")
+    new_status: UserStatus          # 现在只能输入 0、1、2，且自动带校验/文档
     reason: str = "后台调整"
 
 

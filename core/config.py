@@ -66,8 +66,9 @@ MAX_TEAM_LAYER: Final[int] = 6
 
 # ==================== 用户状态 ====================
 class UserStatus(IntEnum):
-    NORMAL = 1
-    HONOR_DIRECTOR = 9
+    NORMAL  = 0   # 恢复正常
+    FROZEN  = 1   # 冻结
+    DELETED = 2   # 注销
 
 # ==================== 奖励类型 ====================
 class RewardType(StrEnum):

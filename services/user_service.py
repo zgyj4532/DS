@@ -5,6 +5,7 @@ from enum import IntEnum
 from core.database import get_conn
 import string
 import random  # 在文件头部加这两行
+from enum import IntEnum
 
 
 
