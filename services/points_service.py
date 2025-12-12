@@ -19,12 +19,23 @@ def add_points(user_id: int, type: str, amount: Decimal, reason: str = "系统�
             if type == "member":
                 cur.execute("UPDATE users SET member_points=member_points+%s WHERE id=%s", (amount, user_id))
                 cur.execute("SELECT member_points FROM users WHERE id=%s", (user_id,))
+                col = "member_points"
             else:
                 cur.execute("UPDATE users SET merchant_points=merchant_points+%s WHERE id=%s", (amount, user_id))
                 cur.execute("SELECT merchant_points FROM users WHERE id=%s", (user_id,))
-            balance_after = Decimal(str(cur.fetchone()[0]))
+                col = "merchant_points"
+
+            row = cur.fetchone()
+            if not row:
+                # 用户不存在或查询失败
+                raise RuntimeError("用户不存在或无法获取余额")
+
+            # cursor 返回 dict-like，使用列名安全获取并降级为 0
+            raw = row.get(col) if isinstance(row, dict) else row[0]
+            balance_after = Decimal(str(raw if raw is not None else 0))
             # 2. 写流水
             cur.execute(
                 "INSERT INTO points_log(user_id, type, change_amount, balance_after, reason) VALUES (%s,%s,%s,%s,%s)",
                 (user_id, type, amount, balance_after, reason)
             )
+            conn.commit()
