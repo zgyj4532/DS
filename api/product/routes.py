@@ -32,10 +32,11 @@ def to_pinyin(text: str) -> str:
     return " ".join(lazy_pinyin(text, style=Style.NORMAL)).upper()
 
 
+# ✅ 修改：在 PRODUCT_COLUMNS 中添加 max_points_discount
 PRODUCT_COLUMNS = ["id", "name", "pinyin", "description", "category",
                    "main_image", "detail_images", "status", "user_id",
                    "is_member_product", "buy_rule", "freight",
-                   "created_at", "updated_at"]
+                   "created_at", "updated_at", "max_points_discount"]
 
 
 def build_product_dict(product: Dict[str, Any], skus: List[Dict[str, Any]] = None,
@@ -45,6 +46,11 @@ def build_product_dict(product: Dict[str, Any], skus: List[Dict[str, Any]] = Non
     base["skus"] = skus or []
     base["attributes"] = attributes or []
     base["freight"] = 0.00
+
+    # ✅ 新增：如果查询结果包含商家名称，添加到返回数据中
+    if 'merchant_name' in product and product['merchant_name']:
+        base['merchant_name'] = product['merchant_name']
+
     # 处理 JSON 字段
     if base.get("detail_images"):
         if isinstance(base["detail_images"], str):
@@ -138,7 +144,7 @@ class ProductUpdate(BaseModel):
     category: Optional[str] = None
     status: Optional[int] = None
     user_id: Optional[int] = None
-    is_member_product: Optional[bool] = None
+    is_member_product: Optional[bool] = None  # ✅ 允许修改会员商品状态
     buy_rule: Optional[str] = None
     freight: Optional[float] = Field(None, ge=0, le=0, description="运费，系统强制0")
     # ✅ 新增字段：积分抵扣上限
@@ -166,7 +172,7 @@ class ProductUpdate(BaseModel):
 @router.get("/products/search", summary="🔍 商品模糊搜索")
 def search_products(
         keyword: str = Query(..., min_length=1,
-                             description="搜索关键词（名称/描述/SKU/拼音/分类/商家）。同时搜索多个关键词时，请在关键词与关键词之间添加空格")
+                             description="搜索关键词（名称/描述/SKU/拼音/分类/商家/属性值）。同时搜索多个关键词时，请在关键词与关键词之间添加空格")
 ):
     """
     1. 按空格拆词，所有词必须同时命中（AND）
@@ -206,6 +212,10 @@ def search_products(
                 word_conditions.append("u.name LIKE %s")
                 params.append(word_pattern)
 
+                # ✅ 修改：只搜索商品属性值，不搜索属性名
+                word_conditions.append("pa.value LIKE %s")
+                params.append(word_pattern)
+
                 # 每个词至少匹配一个字段
                 conditions.append(f"({' OR '.join(word_conditions)})")
 
@@ -214,10 +224,12 @@ def search_products(
 
             # 构建排序：同时命中全部词的置顶（通过计算匹配的字段数）
             # 简化版：按商品ID排序，实际可以优化为按匹配度排序
+            # ✅ 修改：添加 LEFT JOIN product_attributes 表（仅用于搜索value）
             sql = f"""
                 SELECT DISTINCT p.*, u.name as merchant_name
                 FROM products p
                 INNER JOIN product_skus ps ON ps.product_id = p.id
+                LEFT JOIN product_attributes pa ON pa.product_id = p.id  -- ✅ 仅用于搜索value
                 LEFT JOIN users u ON u.id = p.user_id
                 WHERE {where_clause}
                 ORDER BY p.id DESC
@@ -268,6 +280,7 @@ def get_all_products(
         category: Optional[str] = Query(None, description="分类筛选"),
         status: Optional[int] = Query(None, description="状态筛选"),
         is_member_product: Optional[int] = Query(None, description="会员商品筛选，0=非会员，1=会员", ge=0, le=1),
+        user_id: Optional[int] = Query(None, description="商家ID筛选"),  # ✅ 新增：支持按商家筛选
         page: int = Query(1, ge=1, description="页码"),
         size: int = Query(10, ge=1, le=100, description="每页条数"),
 ):
@@ -286,6 +299,9 @@ def get_all_products(
             if is_member_product is not None:
                 where_clauses.append("is_member_product = %s")
                 params.append(is_member_product)
+            if user_id is not None:  # ✅ 新增：支持按商家筛选
+                where_clauses.append("user_id = %s")
+                params.append(user_id)
 
             where_sql = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
@@ -394,11 +410,11 @@ def add_product(payload: ProductCreate):
     with get_conn() as conn:
         with conn.cursor() as cur:
             try:
-                # 处理会员商品价格
+                # 处理会员商品价格: 强制所有SKU价格为1980
                 sku_prices = []
                 for sku in payload.skus:
                     if payload.is_member_product:
-                        sku_prices.append(1980.0)
+                        sku_prices.append(1980.0)  # 会员商品强制1980
                     else:
                         sku_prices.append(sku.price)
 
@@ -406,27 +422,27 @@ def add_product(payload: ProductCreate):
                 pinyin = to_pinyin(payload.name)
                 cur.execute("""
                     INSERT INTO products (name, pinyin, description, category, status, user_id, 
-                                        is_member_product, buy_rule, freight)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                        is_member_product, buy_rule, freight, max_points_discount)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     payload.name, pinyin, payload.description, payload.category, payload.status,
-                    payload.user_id, payload.is_member_product, payload.buy_rule, 0.0
+                    payload.user_id, payload.is_member_product, payload.buy_rule, 0.0,
+                    payload.max_points_discount
                 ))
                 product_id = cur.lastrowid
 
                 # 插入 SKUs
                 for sku, price in zip(payload.skus, sku_prices):
-                    # ✅ 修改：插入新增字段 original_price 和 specifications
                     cur.execute("""
                         INSERT INTO product_skus (product_id, sku_code, price, original_price, stock, specifications)
                         VALUES (%s, %s, %s, %s, %s, %s)
                     """, (
                         product_id,
                         sku.sku_code,
-                        price,
-                        sku.original_price,  # ✅ 新增字段
+                        price,  # 会员商品此时为1980
+                        sku.original_price,
                         sku.stock,
-                        json.dumps(sku.specifications, ensure_ascii=False) if sku.specifications else None  # ✅ 新增字段
+                        json.dumps(sku.specifications, ensure_ascii=False) if sku.specifications else None
                     ))
 
                 # 插入 attributes
@@ -465,12 +481,10 @@ def add_product(payload: ProductCreate):
                     cur,
                     "product_skus",
                     where_clause="product_id = %s",
-                    # ✅ 修改：查询新增字段 original_price 和 specifications
                     select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (product_id,))
                 skus = cur.fetchall()
-                # ✅ 修改：格式化新增字段
                 skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
                          "original_price": float(s['original_price']) if s['original_price'] else None,
                          "stock": s['stock'], "specifications": s['specifications']} for s in skus]
@@ -493,7 +507,7 @@ def add_product(payload: ProductCreate):
                 raise HTTPException(status_code=400, detail=f"创建商品失败: {str(e)}")
 
 
-# ✅ 重写：支持SKU更新的商品更新接口
+# ✅ 重写：支持SKU更新的商品更新接口（灵活控制会员商品价格）
 @router.put("/products/{id}", summary="✏️ 更新商品")
 def update_product(id: int, payload: ProductUpdate):
     with get_conn() as conn:
@@ -510,13 +524,15 @@ def update_product(id: int, payload: ProductUpdate):
                 if not product:
                     raise HTTPException(status_code=404, detail="商品不存在")
 
+                # 获取当前商品的会员状态
+                current_is_member = bool(product.get('is_member_product', 0))
+                new_is_member = payload.is_member_product
+
                 # 构建商品更新字段
                 update_fields = []
                 update_params = []
 
                 update_data = payload.dict(exclude_unset=True, exclude={"attributes", "skus"})
-                # ✅ 禁止修改 is_member_product 字段
-                update_data.pop("is_member_product", None)
 
                 for key, value in update_data.items():
                     if key == "freight":
@@ -534,10 +550,18 @@ def update_product(id: int, payload: ProductUpdate):
                         WHERE id = %s
                     """, tuple(update_params))
 
-                # ✅ 新增：更新 SKU 信息
-                if payload.skus is not None:
+                # ✅ 灵活处理SKU价格：如果商品是会员商品且变为会员商品，强制1980
+                # 但如果提供了skus参数，则使用提供的价
+                if new_is_member is True and not payload.skus:
+                    # 如果没有提供SKU更新，但设置为会员商品，则将所有SKU价格改为1980
+                    cur.execute("""
+                        UPDATE product_skus 
+                        SET price = 1980.00, updated_at = NOW()
+                        WHERE product_id = %s
+                    """, (id,))
+                elif payload.skus is not None:
+                    # 提供了SKU更新参数，灵活控制价格
                     for sku_update in payload.skus:
-                        # 没有id无法定位SKU，跳过
                         if not sku_update.id:
                             continue
 
@@ -547,9 +571,12 @@ def update_product(id: int, payload: ProductUpdate):
                         if sku_update.sku_code is not None:
                             sku_fields.append("sku_code = %s")
                             sku_params.append(sku_update.sku_code)
+
+                        # ✅ 会员商品价格可灵活修改：如果提供了price则修改，否则保持原样
                         if sku_update.price is not None:
                             sku_fields.append("price = %s")
                             sku_params.append(sku_update.price)
+
                         if sku_update.original_price is not None:
                             sku_fields.append("original_price = %s")
                             sku_params.append(sku_update.original_price)
@@ -611,12 +638,10 @@ def update_product(id: int, payload: ProductUpdate):
                     cur,
                     "product_skus",
                     where_clause="product_id = %s",
-                    # ✅ 修改：查询新增字段 original_price 和 specifications
                     select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (id,))
                 skus = cur.fetchall()
-                # ✅ 修改：格式化新增字段
                 skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
                          "original_price": float(s['original_price']) if s['original_price'] else None,
                          "stock": s['stock'], "specifications": s['specifications']} for s in skus]
@@ -762,12 +787,10 @@ def upload_images(
                     cur,
                     "product_skus",
                     where_clause="product_id = %s",
-                    # ✅ 修改：查询新增字段 original_price 和 specifications
                     select_fields=["id", "sku_code", "price", "original_price", "stock", "specifications"]
                 )
                 cur.execute(select_sql, (id,))
                 skus = cur.fetchall()
-                # ✅ 修改：格式化新增字段
                 skus = [{"id": s['id'], "sku_code": s['sku_code'], "price": float(s['price']),
                          "original_price": float(s['original_price']) if s['original_price'] else None,
                          "stock": s['stock'], "specifications": s['specifications']} for s in skus]
