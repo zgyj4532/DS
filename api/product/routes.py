@@ -52,6 +52,21 @@ def build_product_dict(product: Dict[str, Any], skus: List[Dict[str, Any]] = Non
                 base["detail_images"] = json.loads(base["detail_images"])
             except:
                 base["detail_images"] = []
+    # 兼容 main_image 既可能为单个字符串也可能为 JSON 列表的情况
+    if base.get("main_image"):
+        mi = base["main_image"]
+        try:
+            if isinstance(mi, str) and mi.strip().startswith("["):
+                parsed = json.loads(mi)
+                if isinstance(parsed, list):
+                    base["banner_images"] = parsed
+                    base["main_image"] = parsed[0] if parsed else None
+                else:
+                    base["banner_images"] = []
+            else:
+                base["banner_images"] = []
+        except Exception:
+            base["banner_images"] = []
 
     # ✅ 新增：处理SKU的specifications字段
     if base.get("skus"):
