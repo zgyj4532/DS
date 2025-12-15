@@ -1,6 +1,7 @@
+# order.py
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from core.database import get_conn
 from services.finance_service import split_order_funds
 from core.config import VALID_PAY_WAYS
@@ -8,7 +9,7 @@ from core.table_access import build_dynamic_select, get_table_structure, _quote_
 from decimal import Decimal
 import uuid
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import Dict, Any
 
 router = APIRouter()
 
@@ -25,70 +26,129 @@ class OrderManager:
         return ", ".join(select_parts)
 
     @staticmethod
-    def create(user_id: int, address_id: Optional[int], custom_addr: Optional[dict]) -> Optional[str]:
+    def create(
+        user_id: int,
+        address_id: Optional[int],
+        custom_addr: Optional[dict],
+        buy_now: bool = False,
+        buy_now_items: Optional[List[Dict[str, Any]]] = None
+    ) -> Optional[str]:
+        """
+        buy_now=False  -> 购物车结算（老逻辑）
+        buy_now=True   -> 立即购买（新逻辑）
+        buy_now_items 字段在 buy_now=True 时必填，格式：
+        [
+          {
+            "product_id": 123,
+            "quantity": 2,
+            "price": 10.5
+          }
+        ]
+        """
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 1. 读取购物车已选商品
-                cur.execute("""
-                    SELECT c.product_id,
-                           c.quantity,
-                           s.price,
-                           p.is_member_product AS is_vip
-                    FROM cart c
-                    JOIN products p ON c.product_id = p.id
-                    JOIN product_skus s ON s.product_id = p.id
-                    WHERE c.user_id = %s AND c.selected = 1
-                """, (user_id,))
-                items = cur.fetchall()
-                if not items:
-                    return None
+                # ---------- 1. 组装订单明细 ----------
+                if buy_now:
+                    # 立即购买场景
+                    if not buy_now_items:
+                        raise HTTPException(status_code=422, detail="立即购买时 buy_now_items 不能为空")
+                    items = []
+                    for it in buy_now_items:
+                        # 把需要的字段补齐
+                        cur.execute(
+                            "SELECT is_member_product FROM products WHERE id = %s",
+                            (it["product_id"],)
+                        )
+                        prod = cur.fetchone()
+                        if not prod:
+                            raise HTTPException(
+                                status_code=404,
+                                detail=f"products 表中不存在 id={it['product_id']}"
+                            )
+                        items.append({
+                            "product_id": it["product_id"],
+                            "quantity": it["quantity"],
+                            "price": Decimal(str(it["price"])),
+                            "is_vip": prod["is_member_product"]
+                        })
+                else:
+                    # 购物车结算场景（老逻辑）
+                    cur.execute("""
+                        SELECT c.product_id,
+                               c.quantity,
+                               s.price,
+                               p.is_member_product AS is_vip
+                        FROM cart c
+                        JOIN products p ON c.product_id = p.id
+                        JOIN product_skus s ON s.product_id = p.id
+                        WHERE c.user_id = %s AND c.selected = 1
+                    """, (user_id,))
+                    items = cur.fetchall()
+                    if not items:
+                        return None
 
+                # ---------- 2. 订单主表 ----------
                 total = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
                 has_vip = any(i["is_vip"] for i in items)
                 order_number = datetime.now().strftime("%Y%m%d%H%M%S") + str(user_id) + str(uuid.uuid4().int)[:6]
 
-                # 2. 写订单
                 cur.execute("""
                     INSERT INTO orders(user_id, order_number, total_amount, status, is_vip_item, auto_recv_time)
                     VALUES (%s, %s, %s, 'pending_pay', %s, %s)
                 """, (user_id, order_number, total, has_vip, datetime.now() + timedelta(days=7)))
                 oid = cur.lastrowid
 
-                # 3. 库存校验
+                # ---------- 3. 库存校验 & 扣减 ----------
                 structure = get_table_structure(cur, "product_skus")
                 has_stock_field = 'stock' in structure['fields']
                 if has_stock_field:
-                    stock_select = (f"COALESCE({_quote_identifier('stock')}, 0) AS {_quote_identifier('stock')}"
-                                    if 'stock' in structure['asset_fields'] else _quote_identifier('stock'))
+                    stock_select = (
+                        f"COALESCE({_quote_identifier('stock')}, 0) AS {_quote_identifier('stock')}"
+                        if 'stock' in structure['asset_fields']
+                        else _quote_identifier('stock')
+                    )
                 else:
                     stock_select = f"0 AS {_quote_identifier('stock')}"
 
                 for i in items:
-                    cur.execute(f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE product_id=%s", (i['product_id'],))
+                    cur.execute(
+                        f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE product_id=%s",
+                        (i['product_id'],)
+                    )
                     result = cur.fetchone()
                     product_stock = result.get('stock', 0) if result else 0
                     if product_stock < i["quantity"]:
                         raise HTTPException(
                             status_code=400,
                             detail=f"商品库存不足：商品ID {i['product_id']} 当前库存 {product_stock}，需要 {i['quantity']}"
-        )
-                # 4. 订单明细
+                        )
+
+                # ---------- 4. 写订单明细 ----------
                 for i in items:
                     cur.execute("""
                         INSERT INTO order_items(order_id, product_id, quantity, unit_price, total_price)
                         VALUES (%s, %s, %s, %s, %s)
-                    """, (oid, i["product_id"], i["quantity"], i["price"],
-                          Decimal(str(i["quantity"])) * Decimal(str(i["price"]))))
+                    """, (
+                        oid,
+                        i["product_id"],
+                        i["quantity"],
+                        i["price"],
+                        Decimal(str(i["quantity"])) * Decimal(str(i["price"]))
+                    ))
 
-                # 5. 扣库存
+                # ---------- 5. 扣库存 ----------
                 if has_stock_field:
                     for i in items:
-                        cur.execute("UPDATE product_skus SET stock = stock - %s WHERE product_id = %s",
-                                    (i["quantity"], i["product_id"]))
-                # 6. 清空已选购物车
-                cur.execute("DELETE FROM cart WHERE user_id = %s AND selected = 1", (user_id,))
+                        cur.execute(
+                            "UPDATE product_skus SET stock = stock - %s WHERE product_id = %s",
+                            (i["quantity"], i["product_id"])
+                        )
 
-                # 7. 资金拆分
+                # ---------- 6. 清空购物车（仅购物车结算场景） ----------
+                if not buy_now:
+                    cur.execute("DELETE FROM cart WHERE user_id = %s AND selected = 1", (user_id,))
+
+                # ---------- 7. 资金拆分 ----------
                 split_order_funds(order_number, total, has_vip, cursor=cur)
 
                 conn.commit()
@@ -114,7 +174,7 @@ class OrderManager:
             with conn.cursor() as cur:
                 select_fields = OrderManager._build_orders_select(cur)
                 cur.execute(f"SELECT {select_fields} FROM orders WHERE order_number = %s",
-                            (order_number))
+                            (order_number,))
                 order_info = cur.fetchone()
                 if not order_info:
                     return None
@@ -137,11 +197,14 @@ class OrderManager:
                 conn.commit()
                 return True
 
-# ---------------- 路由 ----------------
+# ---------------- 请求模型 ----------------
 class OrderCreate(BaseModel):
     user_id: int
     address_id: Optional[int] = None
     custom_address: Optional[dict] = None
+    # 新增字段
+    buy_now: bool = False
+    buy_now_items: Optional[List[Dict[str, Any]]] = None
 
 class OrderPay(BaseModel):
     order_number: str
@@ -152,9 +215,16 @@ class StatusUpdate(BaseModel):
     new_status: str
     reason: Optional[str] = None
 
+# ---------------- 路由 ----------------
 @router.post("/create", summary="创建订单")
 def create_order(body: OrderCreate):
-    no = OrderManager.create(body.user_id, body.address_id, body.custom_address)
+    no = OrderManager.create(
+        body.user_id,
+        body.address_id,
+        body.custom_address,
+        buy_now=body.buy_now,
+        buy_now_items=body.buy_now_items
+    )
     if not no:
         raise HTTPException(status_code=422, detail="购物车为空或地址缺失")
     return {"order_number": no}
