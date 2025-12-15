@@ -70,6 +70,12 @@ class UserStatus(IntEnum):
     FROZEN  = 1   # 冻结
     DELETED = 2   # 注销
 
+# ==================== 联创星级 ====================
+class UnilevelLevel(IntEnum):
+    ONE   = 1
+    TWO   = 2
+    THREE = 3
+
 # ==================== 奖励类型 ====================
 class RewardType(StrEnum):
     REFERRAL = 'referral'

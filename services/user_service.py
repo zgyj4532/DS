@@ -7,6 +7,7 @@ from core.table_access import build_dynamic_select, _quote_identifier
 import string
 import random
 
+
 # ========== 用户状态枚举 ==========
 class UserStatus(IntEnum):
     NORMAL = 0  # 正常
@@ -242,3 +243,99 @@ class UserService:
                     (int(new_status), mobile))
                 conn.commit()
                 return cur.rowcount > 0
+
+    @staticmethod
+    def promote_unilevel(user_id: int, level: int) -> int:
+        from core.config import UnilevelLevel
+        if level not in {1, 2, 3}:
+            raise ValueError("联创等级只能是 1-3")
+        if not UserService._check_unilevel_rules(user_id, level):
+            raise ValueError("晋升条件未达标")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO user_unilevel(user_id, level) VALUES (%s,%s) "
+                    "ON DUPLICATE KEY UPDATE level=%s",
+                    (user_id, level, level),
+                )
+                conn.commit()
+                return level
+
+    @staticmethod
+    def get_unilevel(user_id: int) -> int:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT level FROM user_unilevel WHERE user_id=%s", (user_id,))
+                row = cur.fetchone()
+                return row["level"] if row else 0
+
+    # ---------- 私有校验 ----------
+    @staticmethod
+    def _check_unilevel_rules(uid: int, target: int) -> bool:
+        """最新规则：前 N 条直推线各存在 1 个【直推≥3六星】的六星"""
+        if UserService.get_level(uid) != 6:
+            return False
+        direct = UserService._count_direct_6star(uid)
+        need = {1: 3, 2: 5, 3: 7}[target]
+        if direct < need:
+            return False
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                return UserService._top_n_lines_have_6star_with_3direct_dynamic(cur, uid, need)
+
+    @staticmethod
+    def _count_direct_6star(uid: int) -> int:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM user_referrals r "
+                    "JOIN users u ON u.id=r.user_id "
+                    "WHERE r.referrer_id=%s AND u.member_level=6",
+                    (uid,),
+                )
+                return cur.fetchone()["c"]
+
+    @staticmethod
+    def get_level(user_id: int) -> int:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT member_level FROM users WHERE id=%s", (user_id,))
+                row = cur.fetchone()
+                return row["member_level"] if row else 0
+
+    @staticmethod
+    def _top_n_lines_have_6star_with_3direct_dynamic(cur, uid: int, n: int) -> bool:
+        """动态版：前 n 条直推线各存在≥1 个【直推≥3六星】的六星"""
+        cur.execute(
+            "SELECT user_id FROM user_referrals WHERE referrer_id=%s ORDER BY id LIMIT %s",
+            (uid, n),
+        )
+        lines = [r["user_id"] for r in cur.fetchall()]
+        if len(lines) < n:
+            return False
+        for top_id in lines:
+            cur.execute(
+                """
+                WITH RECURSIVE team AS (
+                    SELECT %s AS id
+                    UNION ALL
+                    SELECT r.user_id
+                    FROM user_referrals r
+                    JOIN team t ON t.id=r.referrer_id
+                )
+                SELECT 1
+                FROM team
+                JOIN users u ON u.id=team.id
+                WHERE u.member_level=6
+                  AND (SELECT COUNT(*)
+                       FROM user_referrals r2
+                       JOIN users u2 ON u2.id=r2.user_id
+                       WHERE r2.referrer_id=team.id
+                         AND u2.member_level=6) >= 3
+                LIMIT 1
+                """,
+                (top_id,),
+            )
+            if not cur.fetchone():
+                return False
+        return True
