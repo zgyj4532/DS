@@ -1,11 +1,11 @@
-from fastapi import HTTPException, APIRouter, Request
+from fastapi import HTTPException, APIRouter, Request,File, UploadFile,Path
 import uuid
 import datetime
 
 from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
-    PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query
+    PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp
 )
 
 from core.database import get_conn
@@ -17,6 +17,8 @@ from services.points_service import add_points
 from services.reward_service import TeamRewardService
 from services.director_service import DirectorService
 from services.wechat_service import WechatService
+from typing import List
+
 
 logger = get_logger(__name__)
 
@@ -1168,3 +1170,26 @@ def get_unilevel(mobile: str):
                 raise HTTPException(status_code=404, detail="用户不存在")
             level = UserService.get_unilevel(u["id"])
             return {"unilevel": level}
+
+@router.post("/user/{user_id}/avatar", summary="上传用户头像", response_model=AvatarUploadResp)
+def upload_avatar(
+    user_id: int = Path(..., gt=0, description="用户ID"),
+    avatar_files: List[UploadFile] = File(
+        [],
+        description="头像文件，1-3张，单张≤2MB，仅JPG/PNG/WEBP，留空则清空头像"
+    )
+):
+    """
+    行为与 /api/products/{id}/images 完全一致：
+    1. Path 参数
+    2. 支持多张（数组）
+    3. 返回数组 URL
+    4. 留空则清空原有头像
+    """
+    try:
+        urls = UserService.upload_avatar(user_id, avatar_files)
+        return AvatarUploadResp(avatar_urls=urls, uploaded_at=datetime.datetime.now())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"头像上传失败：{e}")
