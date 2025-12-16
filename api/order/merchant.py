@@ -67,6 +67,7 @@ class MerchantManager:
 # ---------------- 路由 ----------------
 class MShip(BaseModel):
     order_number: str
+    tracking_number: str
 
 class MRefundAudit(BaseModel):
     order_number: str
