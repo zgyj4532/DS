@@ -704,20 +704,16 @@ def upload_images(
                 except Exception:
                     detail_urls = []
 
-                # 初始化 banner_urls：兼容 products.main_image 存储为 JSON 列表或单字符串
+                # ✅ 修改：读取现有的轮播图列表（用于追加，而非覆盖）
+                # 第一次上传时会初始化空列表，后续上传会读取已有图片并追加
                 raw_main = product.get('main_image')
+                banner_urls = []
                 try:
                     if raw_main:
                         if isinstance(raw_main, str) and raw_main.strip().startswith('['):
-                            parsed = json.loads(raw_main)
-                            banner_urls = parsed if isinstance(parsed, list) else []
+                            banner_urls = json.loads(raw_main)
                         elif isinstance(raw_main, list):
                             banner_urls = raw_main
-                        else:
-                            # 单张字符串则作为首项
-                            banner_urls = [raw_main]
-                    else:
-                        banner_urls = []
                 except Exception:
                     banner_urls = []
 
@@ -750,7 +746,9 @@ def upload_images(
                 if banner_images:
                     if len(banner_images) > 10:
                         raise HTTPException(status_code=400, detail="轮播图最多10张")
-                    # 将上传的轮播图文件保存并加入 banner_urls 列表（与 detail_images 行为一致）
+
+                    # ✅ 修改：将上传的轮播图文件保存并追加到 banner_urls 列表
+                    # 同时插入到 banner 表，实现追加逻辑而非覆盖
                     for f in banner_images:
                         ext = Path(f.filename).suffix.lower()
                         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
@@ -766,7 +764,13 @@ def upload_images(
                         url = f"/pic/{category}/{id}/{file_name}"
                         banner_urls.append(url)
 
-                    # 更新 products.main_image 为 JSON 列表（与 detail_images 一致）
+                        # ✅ 新增：同步插入到 banner 表，设置 status=1 和自动排序
+                        cur.execute("""
+                            INSERT INTO banner (product_id, image_url, sort_order, status)
+                            VALUES (%s, %s, %s, 1)
+                        """, (id, url, len(banner_urls)))
+
+                    # ✅ 修改：更新 products.main_image 为追加后的完整列表
                     if banner_urls:
                         cur.execute("UPDATE products SET main_image = %s WHERE id = %s",
                                     (json.dumps(banner_urls, ensure_ascii=False), id))
