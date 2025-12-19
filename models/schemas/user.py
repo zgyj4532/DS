@@ -54,7 +54,7 @@ class PointsReq(BaseModel):
     """积分请求"""
     mobile: str
     type: str = Field(pattern="^(member|merchant)$")
-    amount: float = Field(..., ge=0, description="积分数量，支持小数点后4位精度")
+    amount: float = Field(..., description="积分数量（正数增加，负数减少），支持小数点后4位精度")
     reason: str = "系统赠送"
 
 
@@ -162,3 +162,24 @@ class AvatarUploadResp(BaseModel):
     avatar_urls: List[str]          # ← 与商品图一样返回数组
     uploaded_at: datetime
 
+
+class CouponInfo(BaseModel):
+    """优惠券详情模型"""
+    id: int
+    coupon_type: str
+    amount: float = Field(..., description="优惠券金额")
+    status: str
+    valid_from: str = Field(..., description="有效期开始日期(YYYY-MM-DD)")
+    valid_to: str = Field(..., description="有效期结束日期(YYYY-MM-DD)")
+    used_at: Optional[str] = Field(None, description="使用时间")
+    created_at: str = Field(..., description="发放时间")
+    order_no: Optional[str] = Field(None, description="关联订单号（如果有）")
+
+class CouponStats(BaseModel):
+    """优惠券统计信息"""
+    total_count: int
+    unused_count: int
+    used_count: int
+    expired_count: int
+    total_amount: float
+    unused_amount: float
