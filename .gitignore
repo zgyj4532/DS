@@ -16,6 +16,7 @@ logs/
 .venv
 .env
 pic_data/
+user_pic/
 临时文件夹
 数据库表结构优化建议.md
 项目分析与优化建议.md

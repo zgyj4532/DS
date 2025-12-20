@@ -1,6 +1,6 @@
 import uuid
 import bcrypt
-from typing import Optional
+from typing import Optional, Dict, Any
 from enum import IntEnum
 from core.database import get_conn
 from core.table_access import build_dynamic_select, _quote_identifier
@@ -390,3 +390,48 @@ class UserService:
                 conn.commit()
 
         return urls
+
+    # ==================== 优惠券查询功能 ====================
+
+    def query_user_coupons(self, user_id: int, status: str = 'all',
+                           page: int = 1, page_size: int = 20) -> dict:
+        """查询指定用户的优惠券"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 不使用表别名
+                where = ["user_id = %s"]
+                params = [user_id]
+
+                if status != 'all':
+                    if status == 'expired':
+                        where.append("status = 'unused' AND valid_to < CURDATE()")
+                    else:
+                        where.append("status = %s")
+                        params.append(status)
+
+                # 查询总数
+                where_clause = " AND ".join(where)
+                count_sql = f"SELECT COUNT(*) as total FROM coupons WHERE {where_clause}"
+                cur.execute(count_sql, tuple(params))
+                total = cur.fetchone()['total'] or 0
+
+                # 查询明细
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT id, coupon_type, amount, status, valid_from, valid_to,
+                           used_at, created_at
+                    FROM coupons
+                    WHERE {where_clause}
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                coupons = cur.fetchall()
+
+                return {
+                    "coupons": [dict(c) for c in coupons],
+                    "total": total,
+                    "page": page,
+                    "page_size": page_size
+                }

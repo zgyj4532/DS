@@ -1,4 +1,4 @@
-from fastapi import HTTPException, APIRouter, Request,File, UploadFile,Path
+from fastapi import HTTPException, APIRouter, Request,File, UploadFile,Path, Depends
 import uuid
 import datetime
 
@@ -1193,3 +1193,19 @@ def upload_avatar(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"头像上传失败：{e}")
+
+@router.get("/my", summary="查询我的优惠券")
+def get_my_coupons(
+    status: str = "all",
+    page: int = 1,
+    page_size: int = 20,
+    user_id: int = Query(..., description="用户ID")  # ← 改为必填查询参数
+):
+    """查询指定用户的优惠券（user_id从查询参数获取）"""
+    service = UserService()
+    return service.query_user_coupons(
+        user_id=user_id,
+        status=status,
+        page=page,
+        page_size=page_size
+    )
