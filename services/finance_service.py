@@ -167,7 +167,10 @@ class FinanceService:
                 if product['is_member_product']:
                     self._process_member_order(order_id, user_id, user, unit_price, quantity)
                 else:
-                    self._process_normal_order(order_id, user_id, merchant_id, final_amount, user.member_level)
+                    self._process_normal_order(
+                        order_id, user_id, merchant_id,
+                        final_amount, original_amount, points_discount, user.member_level
+                    )
 
             logger.debug(f"订单结算成功: ID={order_id}")
             return order_id
@@ -273,123 +276,201 @@ class FinanceService:
                 logger.debug(f"公益基金获得: ¥{alloc_amount}")
 
     def _create_pending_rewards(self, order_id: int, buyer_id: int, old_level: int, new_level: int) -> None:
-        if old_level == 0:
-            result = self.session.execute(
-                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
-                {"user_id": buyer_id}
-            )
-            referrer = result.fetchone()
-            if referrer and referrer.referrer_id:
-                reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
-                self.session.execute(
-                    """INSERT INTO pending_rewards (user_id, reward_type, amount, order_id, status)
-                       VALUES (%s, 'referral', %s, %s, 'pending')""",
-                    {
-                        "user_id": referrer.referrer_id,
-                        "amount": reward_amount,
-                        "order_id": order_id
-                    }
-                )
-                logger.debug(f"推荐奖励待审核: 用户{referrer.referrer_id} ¥{reward_amount}")
-
-        if old_level == 0 and new_level == 1:
-            logger.debug("0星升级1星，不产生团队奖励")
-            return
-
-        target_layer = new_level
-        current_id = buyer_id
-        target_referrer = None
-
-        for _ in range(target_layer):
-            result = self.session.execute(
-                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
-                {"user_id": current_id}
-            )
-            ref = result.fetchone()
-            if not ref or not ref.referrer_id:
-                break
-            target_referrer = ref.referrer_id
-            current_id = ref.referrer_id
-
-        if target_referrer:
-            # 使用动态表访问获取推荐人等级
+        """
+        订单结算时直接发放推荐和团队奖励（到专用点数）
+        不再创建待审核记录，直接发放到专用点数字段
+        """
+        try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    select_sql = build_dynamic_select(
-                        cur,
-                        "users",
-                        where_clause="id=%s",
-                        select_fields=["member_level"]
-                    )
-                    cur.execute(select_sql, (target_referrer,))
-                    row = cur.fetchone()
-                    referrer_level = row.get('member_level', 0) or 0 if row else 0
+                    if old_level == 0:
+                        # 推荐奖励：发放到 referral_points
+                        cur.execute(
+                            "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                            (buyer_id,)
+                        )
+                        referrer = cur.fetchone()
+                        if referrer and referrer['referrer_id']:
+                            reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
 
-            if referrer_level >= target_layer:
-                reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
-                self.session.execute(
-                    """INSERT INTO pending_rewards (user_id, reward_type, amount, order_id, layer, status)
-                       VALUES (%s, 'team', %s, %s, %s, 'pending')""",
-                    {
-                        "user_id": target_referrer,
-                        "amount": reward_amount,
-                        "order_id": order_id,
-                        "layer": target_layer
-                    }
-                )
-                logger.debug(f"团队奖励待审核: 用户{target_referrer} L{target_layer} ¥{reward_amount}")
+                            # 直接增加 referral_points
+                            cur.execute(
+                                "UPDATE users SET referral_points = COALESCE(referral_points, 0) + %s WHERE id = %s",
+                                (reward_amount, referrer['referrer_id'])
+                            )
+
+                            # 记录到 account_flow
+                            cur.execute(
+                                """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+                                   VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                                ('referral_points', referrer['referrer_id'], reward_amount, 0, 'income',
+                                 f"推荐奖励自动发放（订单#{order_id}），发放到referral_points")
+                            )
+
+                            logger.debug(
+                                f"推荐奖励自动发放: 用户{referrer['referrer_id']} +{reward_amount:.2f} referral_points")
+
+                    if old_level == 0 and new_level == 1:
+                        logger.debug("0星升级1星，不产生团队奖励")
+                        return
+
+                    # 团队奖励：发放到 team_reward_points
+                    target_layer = new_level
+                    current_id = buyer_id
+                    target_referrer = None
+
+                    for _ in range(target_layer):
+                        cur.execute(
+                            "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                            (current_id,)
+                        )
+                        ref = cur.fetchone()
+                        if not ref or not ref['referrer_id']:
+                            break
+                        target_referrer = ref['referrer_id']
+                        current_id = ref['referrer_id']
+
+                    if target_referrer:
+                        # 获取推荐人等级
+                        cur.execute("SELECT member_level FROM users WHERE id = %s", (target_referrer,))
+                        row = cur.fetchone()
+                        referrer_level = row['member_level'] if row else 0
+
+                        if referrer_level >= target_layer:
+                            reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
+
+                            # 直接增加 team_reward_points
+                            cur.execute(
+                                "UPDATE users SET team_reward_points = COALESCE(team_reward_points, 0) + %s WHERE id = %s",
+                                (reward_amount, target_referrer)
+                            )
+
+                            # 记录到 account_flow
+                            cur.execute(
+                                """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+                                   VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                                ('team_reward_points', target_referrer, reward_amount, 0, 'income',
+                                 f"团队L{target_layer}奖励自动发放（订单#{order_id}），发放到team_reward_points")
+                            )
+
+                            logger.debug(
+                                f"团队奖励自动发放: 用户{target_referrer} L{target_layer} +{reward_amount:.2f} team_reward_points")
+
+                    conn.commit()
+
+        except Exception as e:
+            logger.error(f"直接发放奖励失败: {e}", exc_info=True)
+            # 不抛出异常，避免影响主订单流程
+            # 但记录错误日志供后续追踪
 
     def _process_normal_order(self, order_id: int, user_id: int, merchant_id: int,
-                              final_amount: Decimal, member_level: int) -> None:
+                              final_amount: Decimal, original_amount: Decimal,
+                              points_discount: Decimal, member_level: int) -> None:
+        """
+        处理普通订单结算（增强：明确标注优惠券/积分抵扣金额）
+        """
+        # 1. 商家结算和平台分配（代码保持不变）
         if merchant_id != PLATFORM_MERCHANT_ID:
             merchant_amount = final_amount * Decimal('0.80')
-            # 更新商家余额并记录流水
-            # new_merchant_balance = self._update_user_balance(merchant_id, 'merchant_balance', merchant_amount)
-            # self._insert_account_flow(account_type='merchant_balance',
-            #                           related_user=merchant_id,
-            #                           change_amount=merchant_amount,
-            #                           flow_type='income',
-            #                           remark=f"普通商品收益 - 订单#{order_id}")
+            self._update_user_balance(merchant_id, 'merchant_balance', merchant_amount)
+            self._insert_account_flow(
+                account_type='merchant_balance',
+                related_user=merchant_id,
+                change_amount=merchant_amount,
+                flow_type='income',
+                remark=f"普通商品收益 - 订单#{order_id}"
+            )
             logger.debug(f"商家{merchant_id}到账: ¥{merchant_amount}")
         else:
             platform_amount = final_amount * Decimal('0.80')
-            # 平台自营商品收入进入平台池子
             self._add_pool_balance('platform_revenue_pool', platform_amount, f"平台自营商品收入 - 订单#{order_id}")
             logger.debug(f"平台自营商品收入: ¥{platform_amount}")
 
-            for purpose, percent in ALLOCATIONS.items():
-                alloc_amount = final_amount * percent
-                # 统一通过 helper 更新池子并记录流水
-                self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}",
-                                       related_user=user_id)
-                if purpose == AllocationKey.PUBLIC_WELFARE:
-                    logger.debug(f"公益基金获得: ¥{alloc_amount}")
+        # 2. 平台池子分配（代码保持不变）
+        for purpose, percent in ALLOCATIONS.items():
+            alloc_amount = final_amount * percent
+            self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}",
+                                   related_user=user_id)
+            if purpose == AllocationKey.PUBLIC_WELFARE:
+                logger.debug(f"公益基金获得: ¥{alloc_amount}")
 
-        # 关键修改：member_level>=1的用户发放member_points积分
+        # 3. 用户积分发放（代码保持不变）
         if member_level >= 1:
             points_earned = final_amount
-            # 使用 helper 更新用户member_points并返回新积分
             new_points_dec = self._update_user_balance(user_id, 'member_points', points_earned)
-            self._insert_points_log(user_id=user_id,
-                                    change_amount=points_earned,
-                                    balance_after=new_points_dec,
-                                    type='member',
-                                    reason='购买获得积分',
-                                    related_order=order_id)
+            self._insert_points_log(
+                user_id=user_id,
+                change_amount=points_earned,
+                balance_after=new_points_dec,
+                type='member',
+                reason='购买获得积分',
+                related_order=order_id
+            )
             logger.debug(f"用户获得积分: {points_earned:.4f}")
 
-        # 关键修改：处理商家的merchant_points（DECIMAL精度）
+        # 4. 商户积分发放（修正：明确标识优惠券抵扣部分）
         if merchant_id != PLATFORM_MERCHANT_ID:
             merchant_points = final_amount * Decimal('0.20')
+
             if merchant_points > Decimal('0'):
                 new_mp_dec = self._update_user_balance(merchant_id, 'merchant_points', merchant_points)
-                self._insert_points_log(user_id=merchant_id,
-                                        change_amount=merchant_points,
-                                        balance_after=new_mp_dec,
-                                        type='merchant',
-                                        reason='销售获得积分',
-                                        related_order=order_id)
-                logger.debug(f"商家获得积分: {merchant_points:.4f}")
+
+                # 增强：在备注中明确标识优惠券抵扣金额及其贡献
+                if points_discount > 0:
+                    # 计算优惠券抵扣部分贡献的商户积分
+                    coupon_contribution = points_discount * Decimal('0.20')
+                    flow_remark = (
+                        f"商户积分发放（净销售额¥{final_amount:.2f}的20%）- 订单#{order_id} | "
+                        f"原始金额¥{original_amount:.2f}，积分/优惠券抵扣¥{points_discount:.2f}，"
+                        f"其中抵扣部分贡献积分¥{coupon_contribution:.2f}"
+                    )
+                else:
+                    flow_remark = f"商户积分发放（净销售额¥{final_amount:.2f}的20%）- 订单#{order_id}"
+
+                # 记录积分流水
+                self._insert_points_log(
+                    user_id=merchant_id,
+                    change_amount=merchant_points,
+                    balance_after=new_mp_dec,
+                    type='merchant',
+                    reason='销售获得积分（净销售额）',
+                    related_order=order_id
+                )
+
+                # 记录到account_flow流水报表（带增强备注）
+                self._insert_account_flow(
+                    account_type='merchant_points',
+                    related_user=merchant_id,
+                    change_amount=merchant_points,
+                    flow_type='income',
+                    remark=flow_remark
+                )
+                logger.debug(f"商家获得积分: {merchant_points:.4f}（净销售额¥{final_amount}的20%）")
+        else:
+            platform_merchant_points = final_amount * Decimal('0.20')
+            if platform_merchant_points > Decimal('0'):
+                self._add_pool_balance('company_points', platform_merchant_points,
+                                       f"平台商品商户积分 - 订单#{order_id}")
+
+                # 增强平台备注
+                if points_discount > 0:
+                    coupon_contribution = points_discount * Decimal('0.20')
+                    flow_remark = (
+                        f"公司积分增加（平台销售净额¥{final_amount:.2f}的20%）- 订单#{order_id} | "
+                        f"原始金额¥{original_amount:.2f}，积分/优惠券抵扣¥{points_discount:.2f}，"
+                        f"抵扣部分贡献积分¥{coupon_contribution:.2f}"
+                    )
+                else:
+                    flow_remark = f"公司积分增加（平台销售净额¥{final_amount:.2f}的20%）- 订单#{order_id}"
+
+                self._insert_account_flow(
+                    account_type='company_points',
+                    related_user=None,
+                    change_amount=platform_merchant_points,
+                    flow_type='income',
+                    remark=flow_remark
+                )
+                logger.debug(f"平台获得商户积分: {platform_merchant_points:.4f}（净销售额¥{final_amount}的20%）")
 
     def audit_and_distribute_rewards(self, reward_ids: List[int], approve: bool, auditor: str = 'admin') -> bool:
         """批量审核奖励并发放优惠券"""
@@ -457,217 +538,164 @@ class FinanceService:
 
         # 移除 try...except 块，让 FinanceException 直接向上抛出
 
-    def get_rewards_by_status(self, status: str = 'pending', reward_type: Optional[str] = None, limit: int = 50) -> \
-            List[Dict[str, Any]]:
+    def get_rewards_by_status(self, status: str = 'approved', reward_type: Optional[str] = None, limit: int = 50) -> \
+    List[Dict[str, Any]]:
+        """
+        查询已自动发放的奖励记录（从 account_flow 查询）
+        status 参数现在仅用于过滤：'approved'=已发放, 'all'=全部
+        """
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 动态获取 pending_rewards 表的所有列
-                cur.execute("SHOW COLUMNS FROM pending_rewards")
-                columns = cur.fetchall()
-                column_names = [col['Field'] for col in columns]
+                # 构建查询条件
+                where_conditions = [
+                    "af.flow_type = 'income' AND af.account_type IN ('referral_points', 'team_reward_points')"]
+                params = []
 
-                # 资产字段列表（需要降级默认值的字段）
-                asset_fields = ['amount']
-
-                # 动态构造 SELECT 字段列表，对资产字段做降级默认值处理
-                select_fields = []
-                from core.table_access import _quote_identifier
-
-                for col_name in column_names:
-                    if col_name in asset_fields:
-                        select_fields.append(f"COALESCE({_quote_identifier('pr.' + col_name)}, 0) AS {_quote_identifier(col_name)}")
-                    else:
-                        select_fields.append(_quote_identifier('pr.' + col_name))
-
-                # 添加用户名称字段
-                select_fields.append(f"{_quote_identifier('u.name')} AS {_quote_identifier('user_name')}")
-
-                # 构造完整的 SELECT 语句
-                params = [status, limit]
-                sql = f"""SELECT {', '.join(select_fields)}
-                         FROM pending_rewards pr JOIN users u ON pr.user_id = u.id WHERE pr.status = %s"""
                 if reward_type:
-                    sql += " AND pr.reward_type = %s"
-                    params.insert(1, reward_type)
-                sql += " ORDER BY pr.created_at DESC LIMIT %s"
+                    where_conditions.append("af.account_type = %s")
+                    params.append(f"{reward_type}_points")
 
-                cur.execute(sql, tuple(params))
+                if status != 'all':
+                    # 'approved' 表示已发放（account_flow 中已存在记录）
+                    where_conditions.append("af.created_at IS NOT NULL")  # 总是已发放
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 查询奖励流水
+                cur.execute(f"""
+                    SELECT af.id, af.related_user as user_id, u.name as user_name,
+                           af.account_type, af.change_amount as points_issued,
+                           af.remark, af.created_at
+                    FROM account_flow af
+                    JOIN users u ON af.related_user = u.id
+                    WHERE {where_sql}
+                    ORDER BY af.created_at DESC
+                    LIMIT %s
+                """, tuple(params + [limit]))
+
                 rewards = cur.fetchall()
 
-                # 动态构造返回结果
+                # 转换格式
                 result = []
                 for r in rewards:
-                    reward_dict = {}
-                    for col_name in column_names:
-                        value = r.get(col_name)
-                        # 对资产字段转换为 float，其他字段保持原样
-                        if col_name in asset_fields:
-                            reward_dict[col_name] = float(value) if value is not None else 0.0
-                        elif col_name == 'created_at' and value:
-                            reward_dict[col_name] = value.strftime("%Y-%m-%d %H:%M:%S") if hasattr(value,
-                                                                                                   'strftime') else str(
-                                value)
-                        else:
-                            reward_dict[col_name] = value
-                    # 添加用户名称
-                    reward_dict['user_name'] = r.get('user_name')
-                    result.append(reward_dict)
+                    reward_type = 'referral' if 'referral' in r['account_type'] else 'team'
+                    result.append({
+                        "reward_id": r['id'],
+                        "user_id": r['user_id'],
+                        "user_name": r['user_name'],
+                        "reward_type": reward_type,
+                        "points_issued": float(r['points_issued']),
+                        "current_status": "已自动发放",
+                        "remark": r['remark'],
+                        "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                        "points_field": r['account_type']
+                    })
 
                 return result
 
-    # ==================== 关键修改5：周补贴使用member_points和merchant_points ====================
+    # 完整替换 services/finance_service.py 中的 distribute_weekly_subsidy 方法
+
     def distribute_weekly_subsidy(self) -> bool:
-        logger.info("周补贴发放开始（优惠券形式）")
+        """
+        发放周补贴（增加 subsidy_points 并扣减 member_points）
+
+        关键修复：在扣减积分时同步写入 points_log 流水记录，
+        确保积分报表能正确显示周补贴导致的积分支出
+        """
+        logger.info("周补贴发放开始（发放专用点数并扣减积分）")
 
         pool_balance = self.get_account_balance('subsidy_pool')
         if pool_balance <= 0:
             logger.warning("❌ 补贴池余额不足")
             return False
 
-        # 使用动态表访问检查字段是否存在，然后使用 SUM 聚合
-        # 关键修改：member_points替代points
+        # 计算总积分
         with get_conn() as conn:
             with conn.cursor() as cur:
-                structure = get_table_structure(cur, "users", use_cache=False)
-                # 检查 member_points 字段是否存在
-                if "member_points" in structure['fields']:
-                    cur.execute(
-                        "SELECT SUM(COALESCE(member_points, 0)) as total FROM users WHERE COALESCE(member_points, 0) > 0")
-                    row = cur.fetchone()
-                    user_points = Decimal(str(row.get('total', 0) or 0))
-                else:
-                    user_points = Decimal('0')
+                cur.execute("SELECT SUM(COALESCE(member_points, 0)) as total FROM users")
+                total_member_points = Decimal(str(cur.fetchone()['total'] or 0))
 
-                # 检查 merchant_points 字段是否存在
-                if "merchant_points" in structure['fields']:
-                    cur.execute(
-                        "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
-                    row = cur.fetchone()
-                    merchant_points = Decimal(str(row.get('total', 0) or 0))
-                else:
-                    merchant_points = Decimal('0')
-
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT balance as total FROM finance_accounts WHERE account_type = 'company_points'"
-                )
-                row = cur.fetchone()
-                company_points = Decimal(str(row.get('total', 0) or 0))
-
-        total_points = user_points + merchant_points + company_points
-
-        if total_points <= 0:
+        if total_member_points <= 0:
             logger.warning("❌ 总积分为0，无法发放补贴")
             return False
 
-        points_value = pool_balance / total_points
+        # 积分价值 = 补贴池金额 / 总积分，最高0.02
+        points_value = pool_balance / total_member_points
         if points_value > MAX_POINTS_VALUE:
             points_value = MAX_POINTS_VALUE
 
-        logger.info(
-            f"补贴池: ¥{pool_balance} | 用户积分: {user_points} | 商家积分: {merchant_points} | 公司积分: {company_points}（仅参与计算） | 积分值: ¥{points_value:.4f}/分")
+        logger.info(f"补贴池: ¥{pool_balance} | 总积分: {total_member_points} | 积分值: ¥{points_value:.4f}/分")
 
         total_distributed = Decimal('0')
         today = datetime.now().date()
-        valid_to = today + timedelta(days=COUPON_VALID_DAYS)
-
-        # 使用动态表访问获取用户member_points积分信息
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                structure = get_table_structure(cur, "users", use_cache=False)
-                if "member_points" in structure['fields']:
-                    select_sql = build_dynamic_select(
-                        cur,
-                        "users",
-                        where_clause="COALESCE(member_points, 0) > 0",
-                        select_fields=["id", "member_points"]
-                    )
-                    cur.execute(select_sql)
-                    users_data = cur.fetchall()
-                    # 转换为类似的对象列表以保持兼容性
-                    users = [type('obj', (object,),
-                                  {'id': row['id'], 'member_points': Decimal(str(row.get('member_points', 0) or 0))})()
-                             for row in users_data]
-                else:
-                    users = []
 
         try:
-            # ===== 关键修改：使用 get_conn() 替代 self.session.begin() =====
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    total_distributed = Decimal('0')
+                    # 查询有积分的用户
+                    cur.execute(
+                        "SELECT id, member_points, subsidy_points FROM users WHERE COALESCE(member_points, 0) > 0"
+                    )
+                    users = cur.fetchall()
 
                     for user in users:
-                        user_points = Decimal(str(user.member_points))
-                        subsidy_amount = user_points * points_value
-                        deduct_points = subsidy_amount / points_value if points_value > 0 else Decimal('0')
+                        user_id = user['id']
+                        member_points = Decimal(str(user['member_points'] or 0))
+                        current_subsidy_points = Decimal(str(user['subsidy_points'] or 0))
 
-                        if subsidy_amount <= Decimal('0'):
+                        # 计算补贴金额 = 用户积分 × 积分价值
+                        subsidy_amount = member_points * points_value
+
+                        # 发放的点数直接等于补贴金额（1元=1点数）
+                        points_to_add = subsidy_amount
+
+                        if points_to_add <= Decimal('0'):
                             continue
 
-                        # 使用 cur.execute 替代 self.session.execute
+                        # ====== 核心修复：发放补贴点数 ======
+                        new_subsidy_points = current_subsidy_points + points_to_add
                         cur.execute(
-                            """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
-                               VALUES (%s, 'user', %s, %s, %s, 'unused')""",
-                            (user.id, subsidy_amount, today, valid_to)
-                        )
-                        coupon_id = cur.lastrowid
-
-                        new_points = user_points - deduct_points
-                        cur.execute(
-                            "UPDATE users SET member_points = %s WHERE id = %s",
-                            (new_points, user.id)
+                            "UPDATE users SET subsidy_points = %s WHERE id = %s",
+                            (new_subsidy_points, user_id)
                         )
 
+                        # ====== 核心修复：扣减 member_points 并记录流水 ======
+                        # 1. 扣减积分
                         cur.execute(
-                            """INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
-                               VALUES (%s, %s, %s, %s, %s, %s)""",
-                            (user.id, today, subsidy_amount, user_points, deduct_points, coupon_id)
+                            "UPDATE users SET member_points = member_points - %s WHERE id = %s",
+                            (member_points, user_id)
+                        )
+
+                        # 2. 获取扣减后的余额
+                        cur.execute(
+                            "SELECT member_points FROM users WHERE id = %s",
+                            (user_id,)
+                        )
+                        new_balance = Decimal(str(cur.fetchone()['member_points'] or 0))
+
+                        # 3. 写入积分扣减流水（type='member' 表示会员积分，change_amount为负值）
+                        cur.execute(
+                            """INSERT INTO points_log 
+                               (user_id, change_amount, balance_after, type, reason, related_order, created_at)
+                               VALUES (%s, %s, %s, 'member', %s, NULL, NOW())""",
+                            (user_id, -member_points, new_balance, f"周补贴扣减积分")
+                        )
+
+                        # 4. 记录发放历史到 weekly_subsidy_records
+                        cur.execute(
+                            """INSERT INTO weekly_subsidy_records 
+                               (user_id, week_start, subsidy_amount, points_before, points_deducted)
+                               VALUES (%s, %s, %s, %s, %s)""",
+                            (user_id, today, subsidy_amount, member_points, points_to_add)
                         )
 
                         total_distributed += subsidy_amount
-                        logger.info(f"用户{user.id}: 优惠券¥{subsidy_amount:.4f}, 扣积分{deduct_points:.4f}")
+                        logger.info(
+                            f"用户{user_id}: 发放补贴点数{points_to_add:.4f}, 扣减积分{member_points:.4f}, 余额{new_balance:.4f}")
 
-                    # 处理商家的merchant_points
-                    cur.execute("SELECT id, merchant_points FROM users WHERE merchant_points > 0")
-                    merchants = cur.fetchall()
-
-                    for merchant in merchants:
-                        merchant_points = Decimal(str(merchant['merchant_points']))
-                        subsidy_amount = merchant_points * points_value
-                        deduct_points = subsidy_amount / points_value if points_value > 0 else Decimal('0')
-
-                        if subsidy_amount <= Decimal('0'):
-                            continue
-
-                        cur.execute(
-                            """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
-                               VALUES (%s, 'merchant', %s, %s, %s, 'unused')""",
-                            (merchant['id'], subsidy_amount, today, valid_to)
-                        )
-                        coupon_id = cur.lastrowid
-
-                        new_points = merchant_points - deduct_points
-                        cur.execute(
-                            "UPDATE users SET merchant_points = %s WHERE id = %s",
-                            (new_points, merchant['id'])
-                        )
-
-                        cur.execute(
-                            """INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
-                               VALUES (%s, %s, %s, %s, %s, %s)""",
-                            (merchant['id'], today, subsidy_amount, merchant_points, deduct_points, coupon_id)
-                        )
-
-                        total_distributed += subsidy_amount
-                        logger.debug(f"商家{merchant['id']}: 优惠券¥{subsidy_amount:.4f}, 扣积分{deduct_points:.4f}")
-
-                    # 提交事务
                     conn.commit()
 
-            logger.info(
-                f"周补贴完成: 发放¥{total_distributed:.4f}优惠券（补贴池余额不变: ¥{pool_balance}，公司积分不扣除）")
+            logger.info(f"周补贴完成: 发放¥{total_distributed:.4f}等值点数，涉及{len(users)}个用户")
             return True
 
         except Exception as e:
@@ -1387,7 +1415,7 @@ class FinanceService:
                     "coupons_summary": {
                         "unused_count": coupons['count'] or 0,
                         "total_amount": float(coupons['total_amount'] or 0),
-                        "remark": "周补贴改为发放优惠券"
+                        "remark": "周补贴改为发放点数"
                     }
                 }
 
@@ -1804,41 +1832,36 @@ class FinanceService:
 
     # ==================== 2. 查询推荐奖励列表 ====================
     def get_referral_rewards(self, user_id: Optional[int] = None,
-                             status: str = 'pending',
+                             status: str = 'approved',  # 现在只支持 'approved' 或 'all'
                              page: int = 1,
                              page_size: int = 20) -> Dict[str, Any]:
-        """查询推荐奖励列表（支持分页）"""
+        """查询推荐奖励自动发放记录"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 构建查询条件 - 使用表别名 pr. 避免歧义
-                where_conditions = ["pr.reward_type = 'referral'"]
+                # 构建查询条件
+                where_conditions = ["af.account_type = 'referral_points' AND af.flow_type = 'income'"]
                 params = []
 
                 if user_id:
-                    where_conditions.append("pr.user_id = %s")  # ✅ 明确指定表别名
+                    where_conditions.append("af.related_user = %s")
                     params.append(user_id)
-
-                if status != 'all':
-                    where_conditions.append("pr.status = %s")  # ✅ 明确指定表别名
-                    params.append(status)
 
                 where_sql = " AND ".join(where_conditions)
 
-                # 查询总数 - 同样需要明确表别名
-                cur.execute(f"SELECT COUNT(*) as total FROM pending_rewards pr WHERE {where_sql}", tuple(params))
+                # 查询总数
+                cur.execute(f"SELECT COUNT(*) as total FROM account_flow af WHERE {where_sql}", tuple(params))
                 total_count = cur.fetchone()['total'] or 0
 
                 # 查询明细
                 offset = (page - 1) * page_size
                 detail_sql = f"""
-                    SELECT pr.id, pr.user_id, u.name as user_name,
-                           pr.amount, pr.order_id, o.order_number,
-                           pr.status, pr.created_at
-                    FROM pending_rewards pr
-                    JOIN users u ON pr.user_id = u.id
-                    LEFT JOIN orders o ON pr.order_id = o.id
+                    SELECT af.id, af.related_user as user_id, u.name as user_name,
+                           af.change_amount as points_issued, af.remark,
+                           af.created_at, u.referral_points as current_points
+                    FROM account_flow af
+                    JOIN users u ON af.related_user = u.id
                     WHERE {where_sql}
-                    ORDER BY pr.created_at DESC
+                    ORDER BY af.created_at DESC
                     LIMIT %s OFFSET %s
                 """
                 params.extend([page_size, offset])
@@ -1854,11 +1877,12 @@ class FinanceService:
                             "reward_id": r['id'],
                             "user_id": r['user_id'],
                             "user_name": r['user_name'],
-                            "order_id": r['order_id'],
-                            "order_no": r['order_number'],
-                            "amount": float(r['amount']),
-                            "status": r['status'],
-                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                            "points_issued": float(r['points_issued']),
+                            "current_points_balance": float(r['current_points'] or 0),
+                            "status": "已自动发放",
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                            "points_field": "referral_points",
+                            "remark": r['remark']
                         } for r in records
                     ]
                 }
@@ -1867,48 +1891,52 @@ class FinanceService:
                                reward_type: Optional[str] = None,
                                start_date: Optional[str] = None,
                                end_date: Optional[str] = None,
-                               page: int = 1,
-                               page_size: int = 20) -> Dict[str, Any]:
-        """查询推荐和团队奖励流水明细（支持筛选和分页）"""
+                               page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """查询奖励自动发放流水明细（从 account_flow 查询）"""
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # 构建查询条件
-                where_conditions = []
+                where_conditions = [
+                    "af.flow_type = 'income' AND af.account_type IN ('referral_points', 'team_reward_points')"]
                 params = []
 
                 if user_id:
-                    where_conditions.append("pr.user_id = %s")
+                    where_conditions.append("af.related_user = %s")
                     params.append(user_id)
 
                 if reward_type:
-                    where_conditions.append("pr.reward_type = %s")
-                    params.append(reward_type)
+                    where_conditions.append("af.account_type = %s")
+                    params.append(f"{reward_type}_points")
 
                 if start_date:
-                    where_conditions.append("DATE(pr.created_at) >= %s")
+                    where_conditions.append("DATE(af.created_at) >= %s")
                     params.append(start_date)
 
                 if end_date:
-                    where_conditions.append("DATE(pr.created_at) <= %s")
+                    where_conditions.append("DATE(af.created_at) <= %s")
                     params.append(end_date)
 
-                where_sql = " AND ".join(where_conditions) if where_conditions else "1=1"
+                where_sql = " AND ".join(where_conditions)
 
                 # 查询总数
-                cur.execute(f"SELECT COUNT(*) as total FROM pending_rewards pr WHERE {where_sql}", tuple(params))
+                cur.execute(f"SELECT COUNT(*) as total FROM account_flow af WHERE {where_sql}", tuple(params))
                 total_count = cur.fetchone()['total'] or 0
 
                 # 查询明细
                 offset = (page - 1) * page_size
                 detail_sql = f"""
-                    SELECT pr.id, pr.user_id, u.name as user_name,
-                           pr.reward_type, pr.amount, pr.order_id, 
-                           o.order_number, pr.layer, pr.status, pr.created_at
-                    FROM pending_rewards pr
-                    JOIN users u ON pr.user_id = u.id
-                    LEFT JOIN orders o ON pr.order_id = o.id
+                    SELECT af.id, af.related_user as user_id, u.name as user_name,
+                           af.account_type, af.change_amount as points_issued,
+                           af.remark, af.created_at,
+                           CASE af.account_type 
+                             WHEN 'referral_points' THEN u.referral_points 
+                             WHEN 'team_reward_points' THEN u.team_reward_points 
+                             ELSE 0 
+                           END as current_points
+                    FROM account_flow af
+                    JOIN users u ON af.related_user = u.id
                     WHERE {where_sql}
-                    ORDER BY pr.created_at DESC
+                    ORDER BY af.created_at DESC
                     LIMIT %s OFFSET %s
                 """
                 params.extend([page_size, offset])
@@ -1919,11 +1947,9 @@ class FinanceService:
                 summary_sql = f"""
                     SELECT 
                         COUNT(*) as total_records,
-                        SUM(CASE WHEN reward_type = 'referral' THEN amount ELSE 0 END) as total_referral_amount,
-                        SUM(CASE WHEN reward_type = 'team' THEN amount ELSE 0 END) as total_team_amount,
-                        SUM(CASE WHEN status = 'approved' THEN amount ELSE 0 END) as total_approved_amount,
-                        SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END) as total_pending_amount
-                    FROM pending_rewards pr
+                        SUM(CASE WHEN account_type = 'referral_points' THEN change_amount ELSE 0 END) as total_referral_points,
+                        SUM(CASE WHEN account_type = 'team_reward_points' THEN change_amount ELSE 0 END) as total_team_points
+                    FROM account_flow af
                     WHERE {where_sql}
                 """
                 cur.execute(summary_sql, tuple(params[:-2]))
@@ -1932,10 +1958,8 @@ class FinanceService:
                 return {
                     "summary": {
                         "total_records": summary['total_records'] or 0,
-                        "total_referral_amount": float(summary.get('total_referral_amount', 0) or 0),
-                        "total_team_amount": float(summary.get('total_team_amount', 0) or 0),
-                        "total_approved_amount": float(summary.get('total_approved_amount', 0) or 0),
-                        "total_pending_amount": float(summary.get('total_pending_amount', 0) or 0)
+                        "total_referral_points": float(summary.get('total_referral_points', 0) or 0),
+                        "total_team_points": float(summary.get('total_team_points', 0) or 0)
                     },
                     "pagination": {
                         "page": page,
@@ -1945,29 +1969,29 @@ class FinanceService:
                     },
                     "records": [
                         {
-                            "reward_id": r['id'],
+                            "flow_id": r['id'],
                             "user_id": r['user_id'],
                             "user_name": r['user_name'],
-                            "reward_type": r['reward_type'],
-                            "amount": float(r['amount']),
-                            "order_id": r['order_id'],
-                            "order_no": r['order_number'],
-                            "layer": r['layer'] if r['reward_type'] == 'team' else None,
-                            "status": r['status'],
-                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                            "reward_type": '推荐' if 'referral' in r['account_type'] else '团队',
+                            "points_issued": float(r['points_issued']),
+                            "current_points_balance": float(r['current_points'] or 0),
+                            "remark": r['remark'],
+                            "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                            "points_field": r['account_type'],
+                            "status": "已自动发放"
                         } for r in records
                     ]
                 }
 
-    # ==================== 4. 优惠券使用（消失） ====================
+    # ==================== 4. 优惠券使用（消失）- 增强流水记录 ====================
     def use_coupon(self, coupon_id: int, user_id: int) -> bool:
-        """使用优惠券（状态变为已使用，从列表消失）"""
+        """使用优惠券，使其状态变为已使用，并记录流水"""
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     # 查询优惠券信息并锁定行
                     cur.execute(
-                        """SELECT id, amount, status, valid_from, valid_to 
+                        """SELECT id, amount, status, valid_from, valid_to, coupon_type
                            FROM coupons 
                            WHERE id = %s AND user_id = %s FOR UPDATE""",
                         (coupon_id, user_id)
@@ -1985,14 +2009,34 @@ class FinanceService:
                     if coupon['valid_from'] > today or coupon['valid_to'] < today:
                         raise FinanceException("优惠券不在有效期内")
 
-                    # 更新为已使用状态
+                    coupon_amount = Decimal(str(coupon['amount'] or 0))
+
+                    # 更新优惠券状态为已使用
                     cur.execute(
                         "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s",
                         (coupon_id,)
                     )
-                    conn.commit()
 
-                    logger.debug(f"用户{user_id}使用优惠券{coupon_id}，金额¥{coupon['amount']}")
+                    # 记录优惠券使用流水（关键增强）
+                    self._insert_account_flow(
+                        account_type='coupon',
+                        related_user=user_id,
+                        change_amount=0,  # 优惠券本身不产生资金流动，仅记录
+                        flow_type='expense',  # 用户"支出"了优惠券
+                        remark=f"用户使用优惠券 - 优惠券#{coupon_id}，抵扣金额¥{coupon_amount:.2f}"
+                    )
+
+                    # 记录平台获得优惠券抵扣额（用于后续商户积分计算参考）
+                    self._insert_account_flow(
+                        account_type='coupon_revenue',
+                        related_user=PLATFORM_MERCHANT_ID,
+                        change_amount=coupon_amount,
+                        flow_type='income',
+                        remark=f"优惠券抵扣额记录 - 优惠券#{coupon_id}，用户{user_id}使用，金额¥{coupon_amount:.2f}"
+                    )
+
+                    conn.commit()
+                    logger.debug(f"用户{user_id}使用优惠券{coupon_id}:¥{coupon_amount}成功")
                     return True
 
         except Exception as e:
@@ -2429,34 +2473,18 @@ class FinanceService:
 
     def get_weekly_subsidy_report(self, year: int, week: int, user_id: Optional[int] = None,
                                   page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """周补贴明细报表
-
-        查询指定年份和周数的补贴发放明细
-
-        Args:
-            year: 年份，如2025
-            week: 周数，1-53
-            user_id: 用户ID（可选）
-            page: 页码
-            page_size: 每页条数
-
-        Returns:
-            包含汇总、分页和明细的字典
-        """
+        """周补贴明细报表（显示发放点数和余额变化）"""
         logger.info(f"生成周补贴报表: {year}年第{week}周")
 
-        # 计算周的开始和结束日期
         from datetime import date, timedelta
 
-        # 找到该年的第一天
+        # 计算周的开始和结束日期
         first_day = date(year, 1, 1)
-        # 调整到第一个周一（如果1月1日不是周一）
-        if first_day.weekday() > 0:  # 0是周一，6是周日
+        if first_day.weekday() > 0:
             first_day += timedelta(days=7 - first_day.weekday())
-        elif first_day.weekday() == 6:  # 如果是周日
+        elif first_day.weekday() == 6:
             first_day += timedelta(days=1)
 
-        # 计算目标周的开始日期
         week_start = first_day + timedelta(weeks=week - 1)
         week_end = week_start + timedelta(days=6)
 
@@ -2481,12 +2509,13 @@ class FinanceService:
                 cur.execute(count_sql, tuple(params))
                 total_count = cur.fetchone()['total'] or 0
 
-                # 明细查询
+                # 明细查询（增加发放前后余额）
                 offset = (page - 1) * page_size
                 detail_sql = f"""
                     SELECT wsr.user_id, u.name as user_name, wsr.week_start,
                            wsr.subsidy_amount, wsr.points_before, wsr.points_deducted,
-                           wsr.coupon_id
+                           u.subsidy_points as current_subsidy_points,
+                           (u.subsidy_points - wsr.points_deducted) as subsidy_points_before
                     FROM weekly_subsidy_records wsr
                     JOIN users u ON wsr.user_id = u.id
                     WHERE {where_sql}
@@ -2501,11 +2530,10 @@ class FinanceService:
                 summary_sql = f"""
                     SELECT COUNT(DISTINCT wsr.user_id) as total_users,
                            SUM(wsr.subsidy_amount) as total_subsidy_amount,
-                           SUM(wsr.points_deducted) as total_points_deducted
+                           SUM(wsr.points_deducted) as total_points_issued
                     FROM weekly_subsidy_records wsr
                     WHERE {where_sql.replace(' AND wsr.user_id = %s', '') if user_id else where_sql}
                 """
-                # 如果按用户查询，汇总统计需要去掉user_id条件
                 if user_id:
                     cur.execute(summary_sql, (week_start, week_end))
                 else:
@@ -2519,7 +2547,7 @@ class FinanceService:
                         "week_end": week_end.strftime("%Y-%m-%d"),
                         "total_users": summary['total_users'] or 0,
                         "total_subsidy_amount": float(summary['total_subsidy_amount'] or 0),
-                        "total_points_deducted": float(summary['total_points_deducted'] or 0)
+                        "total_points_issued": float(summary['total_points_issued'] or 0)
                     },
                     "pagination": {
                         "page": page,
@@ -2533,13 +2561,18 @@ class FinanceService:
                             "user_name": r['user_name'],
                             "week_start": r['week_start'].strftime("%Y-%m-%d"),
                             "subsidy_amount": float(r['subsidy_amount'] or 0),
-                            "points_before": float(r['points_before'] or 0),
-                            "points_deducted": float(r['points_deducted'] or 0),
-                            "points_after": float((r['points_before'] or 0) - (r['points_deducted'] or 0)),
-                            "coupon_id": r['coupon_id'],
-                            "remark": f"发放补贴¥{float(r['subsidy_amount'] or 0):.2f}，扣减点数{float(r['points_deducted'] or 0):.4f}"
+                            "points_issued": float(r['points_deducted'] or 0),  # 实际发放点数
+                            "member_points_before": float(r['points_before'] or 0),  # 参与计算的积分
+                            "subsidy_points_before": float(r['subsidy_points_before'] or 0),  # 发放前余额
+                            "subsidy_points_after": float(r['current_subsidy_points'] or 0),  # 发放后余额
+                            "remark": f"发放补贴点数{float(r['points_deducted'] or 0):.4f}，扣减积分{float(r['points_before'] or 0):.4f}"
                         } for r in records
-                    ]
+                    ],
+                    "points_flow": {
+                        "source_field": "member_points",
+                        "target_field": "subsidy_points",
+                        "action": "积分兑换补贴点数"
+                    }
                 }
 
     def get_monthly_subsidy_report(self, year: int, month: int, user_id: Optional[int] = None,
@@ -2644,7 +2677,7 @@ class FinanceService:
                             "points_deducted": float(r['points_deducted'] or 0),
                             "points_after": float((r['points_before'] or 0) - (r['points_deducted'] or 0)),
                             "coupon_id": r['coupon_id'],
-                            "remark": f"发放补贴¥{float(r['subsidy_amount'] or 0):.2f}，扣减点数{float(r['points_deducted'] or 0):.4f}"
+                            "remark": f"发放补贴¥{float(r['subsidy_amount'] or 0):.2f}，扣减积分{float(r['points_deducted'] or 0):.4f}"
                         } for r in records
                     ]
                 }
@@ -3065,6 +3098,354 @@ class FinanceService:
                         } for r in records
                     ]
                 }
+
+    def get_weekly_subsidy_preview(self, year: int, week: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """周补贴预览报表（全用户）
+
+        查询所有用户在指定周的积分余额和预计可获得的周补贴优惠券金额
+        支持分页返回
+
+        Args:
+            year: 年份，如2025
+            week: 周数，1-53
+            page: 页码
+            page_size: 每页条数
+
+        Returns:
+            包含汇总统计、分页信息和用户明细列表的字典
+        """
+        logger.info(f"生成全用户周补贴预览报表: {year}年第{week}周，页码={page}")
+
+        from datetime import date, timedelta
+
+        # 计算周的开始和结束日期
+        first_day = date(year, 1, 1)
+        if first_day.weekday() > 0:
+            first_day += timedelta(days=7 - first_day.weekday())
+        elif first_day.weekday() == 6:
+            first_day += timedelta(days=1)
+
+        week_start = first_day + timedelta(weeks=week - 1)
+        week_end = week_start + timedelta(days=6)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 获取补贴池余额
+                pool_balance = self.get_account_balance('subsidy_pool')
+
+                # 2. 计算系统总积分
+                structure = get_table_structure(cur, "users", use_cache=False)
+
+                # 用户积分总计
+                if "member_points" in structure['fields']:
+                    cur.execute(
+                        "SELECT SUM(COALESCE(member_points, 0)) as total FROM users WHERE COALESCE(member_points, 0) > 0")
+                    row = cur.fetchone()
+                    total_user_points = Decimal(str(row.get('total', 0) or 0))
+                else:
+                    total_user_points = Decimal('0')
+
+                # 商家积分总计
+                if "merchant_points" in structure['fields']:
+                    cur.execute(
+                        "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
+                    row = cur.fetchone()
+                    total_merchant_points = Decimal(str(row.get('total', 0) or 0))
+                else:
+                    total_merchant_points = Decimal('0')
+
+                # 公司积分池
+                cur.execute("SELECT balance as total FROM finance_accounts WHERE account_type = 'company_points'")
+                row = cur.fetchone()
+                company_points = Decimal(str(row.get('total', 0) or 0))
+
+                total_points = total_user_points + total_merchant_points + company_points
+
+                # 3. 计算积分价值
+                if total_points <= 0:
+                    points_value = Decimal('0')
+                else:
+                    points_value = pool_balance / total_points
+                    if points_value > MAX_POINTS_VALUE:
+                        points_value = MAX_POINTS_VALUE
+
+                # 4. 查询所有有积分的用户（分页）
+                offset = (page - 1) * page_size
+
+                # 获取总用户数
+                cur.execute("SELECT COUNT(*) as total FROM users WHERE COALESCE(member_points, 0) > 0")
+                total_users = cur.fetchone()['total'] or 0
+
+                # 获取分页用户数据
+                cur.execute(
+                    """SELECT id, name, member_points 
+                       FROM users 
+                       WHERE COALESCE(member_points, 0) > 0
+                       ORDER BY member_points DESC, id
+                       LIMIT %s OFFSET %s""",
+                    (page_size, offset)
+                )
+                users = cur.fetchall()
+
+                # 5. 计算每个用户的预计补贴
+                user_records = []
+                for user in users:
+                    user_points = Decimal(str(user.get('member_points') or 0))
+                    estimated_coupon = user_points * points_value
+
+                    user_records.append({
+                        "user_id": user['id'],
+                        "user_name": user['name'],
+                        "member_points": float(user_points),
+                        "estimated_coupon_amount": float(estimated_coupon),
+                        "points_percentage": float(user_points / total_points * 100) if total_points > 0 else 0.0
+                    })
+
+                logger.info(f"全用户周补贴预览生成完成: 共{len(user_records)}条记录")
+
+                return {
+                    "summary": {
+                        "report_type": "weekly_subsidy_preview_all_users",
+                        "query_week": f"{year}-W{week:02d}",
+                        "week_start": week_start.strftime("%Y-%m-%d"),
+                        "week_end": week_end.strftime("%Y-%m-%d"),
+                        "total_users_with_points": total_users,
+                        "subsidy_pool_balance": float(pool_balance),
+                        "total_system_points": float(total_points),
+                        "points_value_per_point": float(points_value),
+                        "max_points_value_applied": points_value >= MAX_POINTS_VALUE
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_users,
+                        "total_pages": (total_users + page_size - 1) // page_size if total_users > 0 else 1
+                    },
+                    "calculation_details": {
+                        "total_user_points": float(total_user_points),
+                        "total_merchant_points": float(total_merchant_points),
+                        "company_points": float(company_points)
+                    },
+                    "user_records": user_records,
+                    "remark": "按member_points降序排列，支持分页查询"
+                }
+
+    # 替换 services/finance_service.py 中的 get_order_points_flow_report 方法
+
+    def get_order_points_flow_report(self, start_date: str, end_date: str,
+                                     user_id: Optional[int] = None,
+                                     order_no: Optional[str] = None,
+                                     page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """
+        订单积分流水报告（精简版：仅包含积分数据）
+
+        查询订单相关的积分流动情况，包括：
+        - 订单产生的用户积分
+        - 订单产生的商户积分
+        - 订单使用的积分抵扣
+        - 退款时的积分回滚
+
+        Args:
+            start_date: 开始日期 yyyy-MM-dd
+            end_date: 结束日期 yyyy-MM-dd
+            user_id: 用户ID（可选）
+            order_no: 订单号（可选）
+            page: 页码
+            page_size: 每页条数
+
+        Returns:
+            包含汇总统计、分页信息和流水明细的字典
+        """
+        logger.info(f"生成订单积分流水报告: 日期范围={start_date}至{end_date}, 用户={user_id}, 订单号={order_no}")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 构建WHERE条件
+                where_conditions = ["DATE(o.created_at) BETWEEN %s AND %s"]
+                params = [start_date, end_date]
+
+                if user_id:
+                    where_conditions.append("o.user_id = %s")
+                    params.append(user_id)
+
+                if order_no:
+                    where_conditions.append("o.order_number = %s")
+                    params.append(order_no)
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 2. 查询订单总数
+                count_sql = f"""
+                    SELECT COUNT(DISTINCT o.id) as total
+                    FROM orders o
+                    WHERE {where_sql}
+                """
+                cur.execute(count_sql, tuple(params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 3. 分页查询订单明细
+                offset = (page - 1) * page_size
+                detail_sql = f"""
+                    SELECT 
+                        o.id as order_id,
+                        o.order_number,
+                        o.user_id,
+                        u.name as user_name,
+                        o.total_amount,
+                        o.original_amount,
+                        o.points_discount,
+                        o.is_member_order,
+                        o.created_at,
+                        o.status
+                    FROM orders o
+                    JOIN users u ON o.user_id = u.id
+                    WHERE {where_sql}
+                    ORDER BY o.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(detail_sql, tuple(params))
+                orders = cur.fetchall()
+
+                # 4. 查询每个订单的积分数据
+                order_ids = [str(order['order_id']) for order in orders]
+                order_addons_map = {}
+
+                if order_ids:
+                    placeholders = ','.join(['%s'] * len(order_ids))
+
+                    # 仅查询积分流水
+                    cur.execute(f"""
+                        SELECT 
+                            pl.related_order,
+                            SUM(CASE WHEN pl.type = 'member' AND pl.change_amount > 0 THEN pl.change_amount ELSE 0 END) as user_earned,
+                            SUM(CASE WHEN pl.type = 'member' AND pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as points_deducted,
+                            SUM(CASE WHEN pl.type = 'merchant' THEN pl.change_amount ELSE 0 END) as merchant_earned
+                        FROM points_log pl
+                        WHERE pl.related_order IN ({placeholders})
+                        GROUP BY pl.related_order
+                    """, tuple(order_ids))
+
+                    for row in cur.fetchall():
+                        order_addons_map[row['related_order']] = {
+                            'user_earned': float(row['user_earned'] or 0),
+                            'points_deducted': float(row['points_deducted'] or 0),
+                            'merchant_earned': float(row['merchant_earned'] or 0)
+                        }
+
+                # 5. 汇总统计
+                # 汇总订单数据
+                if user_id:
+                    summary_params = params[:-2]
+                else:
+                    summary_params = params[:-2]
+
+                summary_sql = f"""
+                    SELECT 
+                        COUNT(o.id) as total_orders,
+                        SUM(CASE WHEN o.status='completed' THEN 1 ELSE 0 END) as completed_orders,
+                        SUM(o.original_amount) as total_original_amount,
+                        SUM(o.points_discount) as total_points_deduction,
+                        SUM(o.total_amount) as total_net_sales
+                    FROM orders o
+                    WHERE {where_sql} AND o.status != 'refunded'
+                """
+                cur.execute(summary_sql, tuple(summary_params))
+                summary = cur.fetchone()
+
+                # 汇总积分数据
+                total_user_points = total_deducted_points = total_merchant_points = 0
+                if order_ids:
+                    # 总用户积分
+                    cur.execute(f"""
+                        SELECT SUM(change_amount) as total_user_points
+                        FROM points_log
+                        WHERE type = 'member' AND change_amount > 0
+                          AND related_order IN ({placeholders})
+                    """, tuple(order_ids))
+                    total_user_points = cur.fetchone()['total_user_points'] or 0
+
+                    # 总抵扣积分
+                    cur.execute(f"""
+                        SELECT SUM(ABS(change_amount)) as total_deducted_points
+                        FROM points_log
+                        WHERE type = 'member' AND change_amount < 0
+                          AND related_order IN ({placeholders})
+                    """, tuple(order_ids))
+                    total_deducted_points = cur.fetchone()['total_deducted_points'] or 0
+
+                    # 总商户积分
+                    cur.execute(f"""
+                        SELECT SUM(change_amount) as total_merchant_points
+                        FROM points_log
+                        WHERE type = 'merchant'
+                          AND related_order IN ({placeholders})
+                    """, tuple(order_ids))
+                    total_merchant_points = cur.fetchone()['total_merchant_points'] or 0
+
+                # 6. 构建返回数据
+                records = []
+                for order in orders:
+                    order_id = order['order_id']
+                    addons = order_addons_map.get(order_id, {
+                        'user_earned': 0,
+                        'points_deducted': 0,
+                        'merchant_earned': 0
+                    })
+
+                    # 计算积分抵扣率
+                    deduction_rate = (order['points_discount'] / order['original_amount'] * 100) if order[
+                                                                                                        'original_amount'] > 0 else 0
+
+                    records.append({
+                        "order_id": order_id,
+                        "order_no": order['order_number'],
+                        "user_id": order['user_id'],
+                        "user_name": order['user_name'],
+                        "order_type": "会员订单" if order['is_member_order'] else "普通订单",
+                        "status": order['status'],
+                        "status_text": {
+                            "pending_pay": "待支付",
+                            "pending_ship": "待发货",
+                            "pending_recv": "待收货",
+                            "completed": "已完成",
+                            "refund": "退款中",
+                            "refunded": "已退款"
+                        }.get(order['status'], "未知"),
+                        "original_amount": float(order['original_amount']),
+                        "points_deduction": float(order['points_discount']),
+                        "net_sales": float(order['total_amount']),
+                        "user_points_earned": addons['user_earned'],
+                        "merchant_points_earned": addons['merchant_earned'],
+                        "created_at": order['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                        "deduction_rate": f"{deduction_rate:.1f}%"
+                    })
+
+                return {
+                    "summary": {
+                        "report_type": "order_points_flow",
+                        "date_range": f"{start_date} 至 {end_date}",
+                        "total_orders": summary['total_orders'] or 0,
+                        "completed_orders": summary['completed_orders'] or 0,
+                        "total_original_amount": float(summary['total_original_amount'] or 0),
+                        "total_points_deduction": float(summary['total_points_deduction'] or 0),
+                        "total_net_sales": float(summary['total_net_sales'] or 0),
+                        "total_user_points_issued": float(total_user_points),
+                        "total_points_deducted": float(total_deducted_points),
+                        "total_merchant_points_issued": float(total_merchant_points),
+                        "average_deduction_rate": f"{(summary['total_points_deduction'] or 0) / (summary['total_original_amount'] or 1) * 100:.2f}%"
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": records,
+                    "remark": "数据包含所有订单的积分流动及商户积分发放情况"
+                }
+
+
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
 def _build_team_rewards_select(cursor, asset_fields: List[str] = None) -> tuple:

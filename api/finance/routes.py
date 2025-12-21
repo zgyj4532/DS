@@ -400,15 +400,39 @@ async def submit_test_order(
 async def distribute_subsidy(
         service: FinanceService = Depends(get_finance_service)
 ):
+    """手动触发周补贴发放（发放 subsidy_points 专用点数）"""
     try:
-        # 实际调用服务层方法
         success = service.distribute_weekly_subsidy()
         if success:
-            return ResponseModel(success=True, message="周补贴发放成功（优惠券）")
+            return ResponseModel(success=True, message="周补贴发放成功（增加 subsidy_points）")
         else:
             raise HTTPException(status_code=500, detail="补贴发放失败，请检查日志")
     except Exception as e:
         logger.error(f"周补贴失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 周补贴预览报表接口（全用户） ====================
+@router.get("/api/reports/subsidy/preview/weekly", response_model=ResponseModel, summary="周积分预览报表（全用户）")
+async def get_weekly_subsidy_preview(
+    year: int = Query(..., ge=2024, description="年份，如2025"),
+    week: int = Query(..., ge=1, le=53, description="周数，1-53"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询所有用户在指定周的积分余额和预计可获得的周补贴金额（支持分页）"""
+    try:
+        data = service.get_weekly_subsidy_preview(year, week, page, page_size)
+        return ResponseModel(
+            success=True,
+            message=f"全用户周补贴预览报表查询成功: 共{len(data['user_records'])}条记录",
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"周补贴预览报表查询失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -586,25 +610,6 @@ async def audit_withdrawal(
         raise HTTPException(status_code=500, detail=f"审核异常: {str(e)}")
 
 
-@router.post("/api/rewards/audit", response_model=ResponseModel, summary="批量审核奖励")
-async def audit_rewards(
-        request: RewardAuditRequest,
-        service: FinanceService = Depends(get_finance_service)
-):
-    try:
-        success = service.audit_and_distribute_rewards(request.reward_ids, request.approve, request.auditor)
-        if success:
-            action = "批准" if request.approve else "拒绝"
-            return ResponseModel(success=True, message=f"已{action} {len(request.reward_ids)} 条奖励记录")
-        else:
-            raise HTTPException(status_code=500, detail="审核失败，请检查日志")
-    except FinanceException as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"批量审核奖励失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"审核异常: {str(e)}")
-
-
 @router.get("/api/rewards/pending", response_model=ResponseModel, summary="查询奖励列表")
 async def get_pending_rewards(
         service: FinanceService = Depends(get_finance_service),
@@ -674,7 +679,35 @@ async def get_points_deduction_report(
         logger.error(f"查询积分抵扣报表失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
+# ==================== 订单积分流水报告接口 ====================
+@router.get("/api/reports/order-points", response_model=ResponseModel, summary="订单积分流水报告")
+async def get_order_points_flow_report(
+    start_date: str = Query(..., description="开始日期 yyyy-MM-dd"),
+    end_date: str = Query(..., description="结束日期 yyyy-MM-dd"),
+    user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
+    order_no: Optional[str] = Query(None, description="订单号（可选）"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询订单相关的积分流动情况，包括用户积分、商户积分和积分抵扣"""
+    try:
+        data = service.get_order_points_flow_report(
+            start_date=start_date,
+            end_date=end_date,
+            user_id=user_id,
+            order_no=order_no,
+            page=page,
+            page_size=page_size
+        )
+        return ResponseModel(
+            success=True,
+            message=f"订单积分流水报告查询成功: 共{len(data['records'])}条记录",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"订单积分流水报告查询失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 @router.get("/api/admin/reports/transaction-chain", response_model=ResponseModel, summary="交易推荐链报表")
 async def get_transaction_chain_report(
         user_id: int = Query(..., gt=0, description="购买者ID"),
@@ -739,17 +772,17 @@ async def distribute_coupon(
 @router.get("/api/rewards/referral", response_model=ResponseModel, summary="查询推荐奖励")
 async def get_referral_rewards(
     user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选）"),
-    status: str = Query('pending', pattern=r'^(pending|approved|rejected|all)$', description="奖励状态"),
+    status: str = Query('approved', pattern=r'^(approved|all)$', description="奖励状态"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页条数"),
     service: FinanceService = Depends(get_finance_service)
 ):
-    """查询推荐奖励列表（支持筛选和分页）"""
+    """查询推荐奖励自动发放记录（发放到 referral_points）"""
     try:
         data = service.get_referral_rewards(user_id, status, page, page_size)
         return ResponseModel(
             success=True,
-            message="查询成功",
+            message="查询成功（奖励已自动发放到 referral_points）",
             data=data
         )
     except Exception as e:
@@ -768,7 +801,7 @@ async def get_reward_flow(
     page_size: int = Query(20, ge=1, le=100, description="每页条数"),
     service: FinanceService = Depends(get_finance_service)
 ):
-    """查询推荐和团队奖励流水明细（支持筛选和分页）"""
+    """查询奖励自动发放流水明细（从 account_flow 查询）"""
     try:
         data = service.get_reward_flow_report(
             user_id=user_id,
@@ -780,7 +813,7 @@ async def get_reward_flow(
         )
         return ResponseModel(
             success=True,
-            message="查询成功",
+            message=f"奖励流水查询成功: 共{len(data['records'])}条记录",
             data=data
         )
     except Exception as e:
