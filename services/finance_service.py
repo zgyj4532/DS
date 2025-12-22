@@ -155,20 +155,42 @@ class FinanceService:
                         final_amount = original_amount - points_discount
                         logger.debug(f"积分抵扣: {points_to_use:.4f}分 = ¥{points_discount:.4f}")
 
-                    # 6. 创建订单和订单项（全部使用 cur 执行）
-                    cur.execute(
-                        """INSERT INTO orders (order_number, user_id, merchant_id, total_amount, original_amount, points_discount, is_member_order, status)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, 'completed')""",
-                        (order_no, user_id, merchant_id, final_amount, original_amount, points_discount,
-                         product['is_member_product'])
-                    )
-                    order_id = cur.lastrowid
+                    # 6. 创建或更新订单以及写入订单项（全部使用 cur 执行）
+                    cur.execute("SELECT id FROM orders WHERE order_number=%s", (order_no,))
+                    existing_order = cur.fetchone()
+                    if existing_order:
+                        order_id = existing_order['id']
+                        # 更新订单主表为已完成（避免重复插入导致唯一索引冲突）
+                        cur.execute(
+                            """UPDATE orders SET merchant_id=%s, total_amount=%s, original_amount=%s,
+                                       points_discount=%s, is_member_order=%s, status='completed', updated_at=NOW()
+                               WHERE id=%s""",
+                            (merchant_id, final_amount, original_amount, points_discount,
+                             product['is_member_product'], order_id)
+                        )
+                        # 仅在订单没有明细时写入明细，避免重复插入
+                        cur.execute("SELECT COUNT(*) AS cnt FROM order_items WHERE order_id=%s", (order_id,))
+                        cnt = cur.fetchone().get('cnt', 0)
+                        if cnt == 0:
+                            cur.execute(
+                                """INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
+                                   VALUES (%s, %s, %s, %s, %s)""",
+                                (order_id, product_id, quantity, unit_price, original_amount)
+                            )
+                    else:
+                        cur.execute(
+                            """INSERT INTO orders (order_number, user_id, merchant_id, total_amount, original_amount, points_discount, is_member_order, status)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, 'completed')""",
+                            (order_no, user_id, merchant_id, final_amount, original_amount, points_discount,
+                             product['is_member_product'])
+                        )
+                        order_id = cur.lastrowid
 
-                    cur.execute(
-                        """INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
-                           VALUES (%s, %s, %s, %s, %s)""",
-                        (order_id, product_id, quantity, unit_price, original_amount)
-                    )
+                        cur.execute(
+                            """INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
+                               VALUES (%s, %s, %s, %s, %s)""",
+                            (order_id, product_id, quantity, unit_price, original_amount)
+                        )
 
                     # 7. 处理订单逻辑（会员商品 vs 普通商品）
                     if product['is_member_product']:

@@ -123,6 +123,7 @@ class DatabaseManager:
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     order_number VARCHAR(50) UNIQUE COMMENT '订单号（兼容订单系统）',
                     user_id BIGINT UNSIGNED NOT NULL,
+                    merchant_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
                     total_amount DECIMAL(12,2) NOT NULL,
                     original_amount DECIMAL(12,2) DEFAULT 0.00,
                     points_discount DECIMAL(12,4) NOT NULL DEFAULT 0.0000,

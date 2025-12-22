@@ -127,7 +127,7 @@ class OrderStatus(StrEnum):
     REFUNDED = 'refunded'
 
 # ==================== 支付配置 ====================
-VALID_PAY_WAYS: Final[set[str]] = {"alipay", "wechat", "card", "wx_pub", "wx_app"}
+VALID_PAY_WAYS: Final[set[str]] = {"alipay", "wechat", "card", "wx_pub", "wx_app","paid","pending_pay"}
 
 # ==================== 日志配置 ====================
 LOG_DIR: Final[Path] = Path(__file__).resolve().parent.parent / 'logs'
