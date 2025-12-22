@@ -347,9 +347,15 @@ class FinanceService:
     # ==================== 创建待发放奖励（v2版本） ====================
     def _create_pending_rewards_v2(self, cur, order_id: int, buyer_id: int,
                                    old_level: int, new_level: int) -> None:
-        """创建推荐和团队奖励（v2：接受cursor参数）"""
+        """
+        创建推荐和团队奖励（v2：接受cursor参数）
+
+        关键逻辑：
+        1. 0星升级1星：只发放推荐奖励，不产生团队奖励
+        2. 其他升级：按升级到的星级层级发放团队奖励
+        """
+        # 1. 推荐奖励（仅首次购买会员商品时发放）
         if old_level == 0:
-            # 推荐奖励
             cur.execute(
                 "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
                 (buyer_id,)
@@ -375,8 +381,62 @@ class FinanceService:
                      referrer['referrer_id'], 'income', f"推荐奖励自动发放（订单#{order_id}）")
                 )
 
-        # 团队奖励（逻辑类似，此处省略详细代码...）
-        # 如需完整实现，请告诉我
+                logger.debug(f"推荐奖励自动发放: 用户{referrer['referrer_id']} +{reward_amount:.2f} referral_points")
+
+        # 2. 团队奖励
+        if old_level == 0 and new_level == 1:
+            logger.debug("0星升级1星，不产生团队奖励")
+            return
+
+        # 计算目标层级：升级到N星，就找第N层上线的团队奖励资格
+        target_layer = new_level  # 例如：升级到3星，找第3层上线
+        current_id = buyer_id
+        target_referrer = None
+
+        # 向上追溯目标层级的推荐人
+        for _ in range(target_layer):
+            cur.execute(
+                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                (current_id,)
+            )
+            ref = cur.fetchone()
+            if not ref or not ref['referrer_id']:
+                logger.debug(f"第{target_layer}层推荐人不存在")
+                return
+            target_referrer = ref['referrer_id']
+            current_id = ref['referrer_id']
+
+        if target_referrer:
+            # 获取推荐人等级
+            cur.execute("SELECT member_level FROM users WHERE id = %s", (target_referrer,))
+            row = cur.fetchone()
+            referrer_level = row['member_level'] if row else 0
+
+            # 检查推荐人等级是否达标（必须 >= 目标层级）
+            if referrer_level >= target_layer:
+                reward_amount = MEMBER_PRODUCT_PRICE * Decimal('0.50')
+
+                # 直接发放到 team_reward_points
+                cur.execute(
+                    "UPDATE users SET team_reward_points = COALESCE(team_reward_points, 0) + %s WHERE id = %s",
+                    (reward_amount, target_referrer)
+                )
+
+                # 记录流水
+                cur.execute(
+                    """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                       flow_type, remark, created_at)
+                       VALUES (%s, %s, %s, 
+                              (SELECT team_reward_points FROM users WHERE id = %s), 
+                              %s, %s, NOW())""",
+                    ('team_reward_points', target_referrer, reward_amount,
+                     target_referrer, 'income', f"团队L{target_layer}奖励自动发放（订单#{order_id}）")
+                )
+
+                logger.debug(
+                    f"团队奖励自动发放: 用户{target_referrer} L{target_layer} +{reward_amount:.2f} team_reward_points")
+            else:
+                logger.debug(f"推荐人等级不足: 需要{target_layer}星，实际{referrer_level}星")
 
     def _create_order(self, order_no: str, user_id: int, merchant_id: int,
                       product_id: int, total_amount: Decimal, original_amount: Decimal,
