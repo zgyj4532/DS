@@ -48,14 +48,7 @@ class FinanceService:
         return True
 
     def check_purchase_limit(self, user_id: int) -> bool:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) as count FROM orders WHERE user_id = %s AND is_member_order = 1 AND created_at >= NOW() - INTERVAL 24 HOUR AND status != 'refunded'",
-                    (user_id,)
-                )
-                row = cur.fetchone()
-                return row['count'] < MAX_PURCHASE_PER_DAY if row else False
+        return True
 
     def get_account_balance(self, account_type: str) -> Decimal:
         """直接获取连接，绕过 PyMySQLAdapter 的连接管理问题"""
@@ -117,21 +110,19 @@ class FinanceService:
                     if not product or product['price'] is None:
                         raise OrderException(f"商品不存在、已下架或无价格信息: {product_id}")
 
-                    merchant_id = product['user_id']
-                    if merchant_id != PLATFORM_MERCHANT_ID:
-                        cur.execute("SELECT id FROM users WHERE id = %s", (merchant_id,))
-                        if not cur.fetchone():
-                            raise OrderException(f"商家不存在: {merchant_id}")
+                    # 关键修改：所有商品都视为平台自营，取消商家检查
+                    merchant_id = PLATFORM_MERCHANT_ID
 
-                    # 2. 检查会员商品购买限制
-                    if product['is_member_product']:
-                        cur.execute(
-                            "SELECT COUNT(*) as count FROM orders WHERE user_id = %s AND is_member_order = 1 AND created_at >= NOW() - INTERVAL 24 HOUR AND status != 'refunded'",
-                            (user_id,)
-                        )
-                        row = cur.fetchone()
-                        if row and row['count'] >= MAX_PURCHASE_PER_DAY:
-                            raise OrderException("24小时内购买会员商品超过限制（最多2份）")
+                    # 2. 检查会员商品购买限制 - 已取消限制
+                    # 注释掉原有的限购检查代码
+                    # if product['is_member_product']:
+                    #     cur.execute(
+                    #         "SELECT COUNT(*) as count FROM orders WHERE user_id = %s AND is_member_order = 1 AND created_at >= NOW() - INTERVAL 24 HOUR AND status != 'refunded'",
+                    #         (user_id,)
+                    #     )
+                    #     row = cur.fetchone()
+                    #     if row and row['count'] >= MAX_PURCHASE_PER_DAY:
+                    #         raise OrderException("24小时内购买会员商品超过限制（最多2份）")
 
                     # 3. 查询并锁定用户信息（关键：FOR UPDATE）
                     select_sql = build_dynamic_select(
@@ -157,8 +148,8 @@ class FinanceService:
                     final_amount = original_amount
                     points_discount = Decimal('0')
 
-                    # 5. 处理积分抵扣（普通商品）
-                    if not product['is_member_product'] and points_to_use > Decimal('0'):
+                    # 5. 处理积分抵扣（关键修改：取消会员商品不能使用积分抵扣的限制）
+                    if points_to_use > Decimal('0'):  # 移除对product['is_member_product']的判断
                         self._apply_points_discount_v2(cur, user_id, user, points_to_use, original_amount)
                         points_discount = points_to_use * POINTS_DISCOUNT_RATE
                         final_amount = original_amount - points_discount
@@ -268,27 +259,16 @@ class FinanceService:
                                  final_amount: Decimal, original_amount: Decimal,
                                  points_discount: Decimal, member_level: int) -> None:
         """处理普通订单（v2：接受cursor参数）"""
-        # 1. 商家结算
-        if merchant_id != PLATFORM_MERCHANT_ID:
-            merchant_amount = final_amount * Decimal('0.80')
-            cur.execute(
-                "UPDATE users SET merchant_balance = merchant_balance + %s WHERE id = %s",
-                (merchant_amount, merchant_id)
-            )
-            cur.execute(
-                """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
-                   VALUES (%s, %s, %s, (SELECT merchant_balance FROM users WHERE id = %s), %s, %s, NOW())""",
-                ('merchant_balance', merchant_id, merchant_amount, merchant_id, 'income',
-                 f"普通商品收益 - 订单#{order_id}")
-            )
-        else:
-            platform_amount = final_amount * Decimal('0.80')
-            cur.execute(
-                "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'platform_revenue_pool'",
-                (platform_amount,)
-            )
+        # 关键修改：所有商品都是平台自营，直接分配到平台池子
+        # 1. 平台池子分配（所有金额都进入平台收入池）
+        platform_amount = final_amount
+        cur.execute(
+            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'platform_revenue_pool'",
+            (platform_amount,)
+        )
+        logger.debug(f"平台收入池增加: ¥{platform_amount:.4f}")
 
-        # 2. 平台池子分配
+        # 2. 从平台收入池分配到其他池子（按原有比例）
         for purpose, percent in ALLOCATIONS.items():
             if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
                 continue
@@ -297,6 +277,7 @@ class FinanceService:
                 "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
                 (alloc_amount, purpose.value)
             )
+            logger.debug(f"池子分配 {purpose.value}: ¥{alloc_amount:.4f}")
 
         # 3. 用户积分发放（一星及以上）
         if member_level >= 1:
@@ -311,20 +292,30 @@ class FinanceService:
                           'member', %s, %s, NOW())""",
                 (user_id, points_earned, user_id, '购买获得积分', order_id)
             )
+            logger.debug(f"用户获得积分: {points_earned:.4f}")
 
-        # 4. 商户积分发放
-        if merchant_id != PLATFORM_MERCHANT_ID:
-            merchant_points = final_amount * Decimal('0.20')
-            cur.execute(
-                "UPDATE users SET merchant_points = merchant_points + %s WHERE id = %s",
-                (merchant_points, merchant_id)
-            )
-            cur.execute(
-                """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
-                   VALUES (%s, %s, (SELECT merchant_points FROM users WHERE id = %s), 
-                          'merchant', %s, %s, NOW())""",
-                (merchant_id, merchant_points, merchant_id, '销售获得积分', order_id)
-            )
+        # 4. 商户积分发放 - 已取消，所有商品都是平台自营
+        # 注释掉原有的商户积分发放代码
+        # if merchant_id != PLATFORM_MERCHANT_ID:
+        #     merchant_points = final_amount * Decimal('0.20')
+        #     cur.execute(
+        #         "UPDATE users SET merchant_points = merchant_points + %s WHERE id = %s",
+        #         (merchant_points, merchant_id)
+        #     )
+        #     cur.execute(
+        #         """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
+        #            VALUES (%s, %s, (SELECT merchant_points FROM users WHERE id = %s),
+        #                   'merchant', %s, %s, NOW())""",
+        #         (merchant_id, merchant_points, merchant_id, '销售获得积分', order_id)
+        #     )
+        # else:
+        # 平台自营商品，公司积分池增加
+        platform_merchant_points = final_amount * Decimal('0.20')
+        cur.execute(
+            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
+            (platform_merchant_points,)
+        )
+        logger.debug(f"公司积分池增加: {platform_merchant_points:.4f}")
 
     # ==================== 资金池分配（v2版本） ====================
     def _allocate_funds_to_pools_v2(self, cur, order_id: int, total_amount: Decimal) -> None:
@@ -608,25 +599,16 @@ class FinanceService:
         """
         处理普通订单结算（增强：明确标注优惠券/积分抵扣金额）
         """
-        # 1. 商家结算和平台分配（代码保持不变）
-        if merchant_id != PLATFORM_MERCHANT_ID:
-            merchant_amount = final_amount * Decimal('0.80')
-            self._update_user_balance(merchant_id, 'merchant_balance', merchant_amount)
-            self._insert_account_flow(
-                account_type='merchant_balance',
-                related_user=merchant_id,
-                change_amount=merchant_amount,
-                flow_type='income',
-                remark=f"普通商品收益 - 订单#{order_id}"
-            )
-            logger.debug(f"商家{merchant_id}到账: ¥{merchant_amount}")
-        else:
-            platform_amount = final_amount * Decimal('0.80')
-            self._add_pool_balance('platform_revenue_pool', platform_amount, f"平台自营商品收入 - 订单#{order_id}")
-            logger.debug(f"平台自营商品收入: ¥{platform_amount}")
+        # 关键修改：所有商品都是平台自营，直接分配到平台池子
+        # 1. 平台池子分配（所有金额都进入平台收入池）
+        platform_amount = final_amount * Decimal('0.80')
+        self._add_pool_balance('platform_revenue_pool', platform_amount, f"平台自营商品收入 - 订单#{order_id}")
+        logger.debug(f"平台自营商品收入: ¥{platform_amount}")
 
         # 2. 平台池子分配（代码保持不变）
         for purpose, percent in ALLOCATIONS.items():
+            if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
+                continue
             alloc_amount = final_amount * percent
             self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}",
                                    related_user=user_id)
@@ -647,69 +629,32 @@ class FinanceService:
             )
             logger.debug(f"用户获得积分: {points_earned:.4f}")
 
-        # 4. 商户积分发放（修正：明确标识优惠券抵扣部分）
-        if merchant_id != PLATFORM_MERCHANT_ID:
-            merchant_points = final_amount * Decimal('0.20')
+        # 4. 商户积分发放 - 已取消，所有商品都是平台自营
+        # 平台自营商品，公司积分池增加
+        platform_merchant_points = final_amount * Decimal('0.20')
+        if platform_merchant_points > Decimal('0'):
+            self._add_pool_balance('company_points', platform_merchant_points,
+                                   f"平台商品商户积分 - 订单#{order_id}")
 
-            if merchant_points > Decimal('0'):
-                new_mp_dec = self._update_user_balance(merchant_id, 'merchant_points', merchant_points)
-
-                # 增强：在备注中明确标识优惠券抵扣金额及其贡献
-                if points_discount > 0:
-                    # 计算优惠券抵扣部分贡献的商户积分
-                    coupon_contribution = points_discount * Decimal('0.20')
-                    flow_remark = (
-                        f"商户积分发放（净销售额¥{final_amount:.2f}的20%）- 订单#{order_id} | "
-                        f"原始金额¥{original_amount:.2f}，积分/优惠券抵扣¥{points_discount:.2f}，"
-                        f"其中抵扣部分贡献积分¥{coupon_contribution:.2f}"
-                    )
-                else:
-                    flow_remark = f"商户积分发放（净销售额¥{final_amount:.2f}的20%）- 订单#{order_id}"
-
-                # 记录积分流水
-                self._insert_points_log(
-                    user_id=merchant_id,
-                    change_amount=merchant_points,
-                    balance_after=new_mp_dec,
-                    type='merchant',
-                    reason='销售获得积分（净销售额）',
-                    related_order=order_id
+            # 增强平台备注
+            if points_discount > 0:
+                coupon_contribution = points_discount * Decimal('0.20')
+                flow_remark = (
+                    f"公司积分增加（平台销售净额¥{final_amount:.2f}的20%）- 订单#{order_id} | "
+                    f"原始金额¥{original_amount:.2f}，积分/优惠券抵扣¥{points_discount:.2f}，"
+                    f"抵扣部分贡献积分¥{coupon_contribution:.2f}"
                 )
+            else:
+                flow_remark = f"公司积分增加（平台销售净额¥{final_amount:.2f}的20%）- 订单#{order_id}"
 
-                # 记录到account_flow流水报表（带增强备注）
-                self._insert_account_flow(
-                    account_type='merchant_points',
-                    related_user=merchant_id,
-                    change_amount=merchant_points,
-                    flow_type='income',
-                    remark=flow_remark
-                )
-                logger.debug(f"商家获得积分: {merchant_points:.4f}（净销售额¥{final_amount}的20%）")
-        else:
-            platform_merchant_points = final_amount * Decimal('0.20')
-            if platform_merchant_points > Decimal('0'):
-                self._add_pool_balance('company_points', platform_merchant_points,
-                                       f"平台商品商户积分 - 订单#{order_id}")
-
-                # 增强平台备注
-                if points_discount > 0:
-                    coupon_contribution = points_discount * Decimal('0.20')
-                    flow_remark = (
-                        f"公司积分增加（平台销售净额¥{final_amount:.2f}的20%）- 订单#{order_id} | "
-                        f"原始金额¥{original_amount:.2f}，积分/优惠券抵扣¥{points_discount:.2f}，"
-                        f"抵扣部分贡献积分¥{coupon_contribution:.2f}"
-                    )
-                else:
-                    flow_remark = f"公司积分增加（平台销售净额¥{final_amount:.2f}的20%）- 订单#{order_id}"
-
-                self._insert_account_flow(
-                    account_type='company_points',
-                    related_user=None,
-                    change_amount=platform_merchant_points,
-                    flow_type='income',
-                    remark=flow_remark
-                )
-                logger.debug(f"平台获得商户积分: {platform_merchant_points:.4f}（净销售额¥{final_amount}的20%）")
+            self._insert_account_flow(
+                account_type='company_points',
+                related_user=None,
+                change_amount=platform_merchant_points,
+                flow_type='income',
+                remark=flow_remark
+            )
+            logger.debug(f"平台获得商户积分: {platform_merchant_points:.4f}（净销售额¥{final_amount}的20%）")
 
     def audit_and_distribute_rewards(self, reward_ids: List[int], approve: bool, auditor: str = 'admin') -> bool:
         """批量审核奖励并发放优惠券"""

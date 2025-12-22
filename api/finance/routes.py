@@ -1160,6 +1160,55 @@ async def get_pool_flow_report(
     except Exception as e:
         logger.error(f"查询资金池流水报表失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+# 在 api/finance/routes.py 中添加以下代码
+
+# ==================== 平台积分余额查询接口 ====================
+@router.get("/api/finance/points/company", response_model=ResponseModel, summary="查询平台积分余额")
+async def get_company_points_balance(
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询公司积分账户（company_points）的当前余额"""
+    try:
+        balance = service.get_account_balance('company_points')
+        return ResponseModel(
+            success=True,
+            message="查询成功",
+            data={
+                "account_name": "公司积分账户",
+                "account_type": "company_points",
+                "balance": float(balance),
+                "reserved": 0.0,
+                "remark": "平台自有积分储备，用于积分抵扣等业务"
+            }
+        )
+    except Exception as e:
+        logger.error(f"查询平台积分余额失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 平台资金余额查询接口 ====================
+@router.get("/api/finance/pool/platform-revenue", response_model=ResponseModel, summary="查询平台资金余额")
+async def get_platform_revenue_balance(
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询平台收入池（platform_revenue_pool）的当前余额"""
+    try:
+        balance = service.get_account_balance('platform_revenue_pool')
+        return ResponseModel(
+            success=True,
+            message="查询成功",
+            data={
+                "account_name": "平台收入池",
+                "account_type": "platform_revenue_pool",
+                "balance": float(balance),
+                "reserved": 0.0,
+                "remark": "平台运营资金池，主要来源于商品销售收入的80%"
+            }
+        )
+    except Exception as e:
+        logger.error(f"查询平台资金余额失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])
