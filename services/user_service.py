@@ -502,6 +502,7 @@ class UserService:
                 conn.commit()
                 return target_level
 
+    '''
     @staticmethod
     def get_user_special_points(user_id: int) -> Dict[str, float]:
         """
@@ -586,7 +587,7 @@ class UserService:
                 return {
                     "unilevel_points": float(row['unilevel_points'])
                 }
-
+'''
     @staticmethod
     def get_user_all_points(user_id: int) -> Dict[str, float]:
         """
@@ -636,6 +637,7 @@ class UserService:
                     "total_points": total
                 }
 
+    '''
     @staticmethod
     def clear_reward_points(user_id: int, reason: str = "后台清除") -> Dict[str, Any]:
         """
@@ -824,4 +826,72 @@ class UserService:
                     "message": f"联创星级点数已清除（原因：{reason}）",
                     "old_unilevel_points": old_points,
                     "new_unilevel_points": 0
+                }
+'''
+    @staticmethod
+    def get_points_summary(user_id: int) -> Dict[str, float]:
+        """
+        查询用户点数汇总信息
+
+        业务定义：
+        - 四个专用点数：各渠道累计获得的点数
+        - true_total_points：剩余可用点数
+        - 累计总值 = 四个专用点数之和
+        - 已使用点数 = 累计总值 - 剩余点数
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 动态获取表结构
+                cur.execute("SHOW COLUMNS FROM users")
+                user_cols = [r["Field"] for r in cur.fetchall()]
+
+                # 基础查询字段（四个点数）
+                select_fields = [
+                    "COALESCE(points, 0) as unilevel_points",
+                    "COALESCE(subsidy_points, 0) as subsidy_points",
+                    "COALESCE(team_reward_points, 0) as team_reward_points",
+                    "COALESCE(referral_points, 0) as referral_points"
+                ]
+
+                # 检查是否存在 true_total_points 字段
+                has_true_total = "true_total_points" in user_cols
+                if has_true_total:
+                    select_fields.append("COALESCE(true_total_points, 0) as true_total_points")
+
+                # 执行查询
+                sql = f"""
+                    SELECT {', '.join(select_fields)}
+                    FROM users
+                    WHERE id = %s
+                """
+                cur.execute(sql, (user_id,))
+                row = cur.fetchone()
+
+                if not row:
+                    raise ValueError("用户不存在")
+
+                # 计算四个点数的累计总值
+                unilevel = float(row['unilevel_points'])
+                subsidy = float(row['subsidy_points'])
+                team = float(row['team_reward_points'])
+                referral = float(row['referral_points'])
+                cumulative_total = unilevel + subsidy + team + referral
+
+                # 剩余点数直接读取 true_total_points
+                if has_true_total:
+                    remaining_points = float(row['true_total_points'])
+                else:
+                    remaining_points = 0.0
+
+                # 计算已使用点数
+                used_points = cumulative_total - remaining_points
+
+                return {
+                    "unilevel_points": unilevel,
+                    "subsidy_points": subsidy,
+                    "team_reward_points": team,
+                    "referral_points": referral,
+                    "cumulative_total": cumulative_total,
+                    "remaining_points": remaining_points,
+                    "used_points": used_points
                 }

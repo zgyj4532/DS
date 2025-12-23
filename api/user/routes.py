@@ -6,8 +6,7 @@ from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
     PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
-    UnilevelStatusResponse, UnilevelPromoteResponse,UserSpecialPointsResponse,UserSubsidyPointsResponse,
-    UserUnilevelPointsResponse,UserAllPointsResponse,ClearRewardPointsReq,ClearSubsidyPointsReq,ClearUnilevelPointsReq
+    UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse
 )
 
 from core.database import get_conn
@@ -1235,7 +1234,7 @@ def promote_unilevel(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
+'''
 @router.get("/special-points", response_model=UserSpecialPointsResponse, summary="查询推荐和团队奖励点数")
 def get_user_special_points(
     user_id: int = Query(..., description="用户ID", gt=0)
@@ -1283,6 +1282,7 @@ def get_user_unilevel_points(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+'''
 
 @router.get("/all-points", response_model=UserAllPointsResponse, summary="查询用户四个点数总和")
 def get_user_all_points(
@@ -1298,7 +1298,7 @@ def get_user_all_points(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
-
+'''
 
 @router.post("/points/clear-reward", summary="后台一键清除推荐和团队奖励点数")
 def clear_reward_points(body: ClearRewardPointsReq):
@@ -1359,3 +1359,23 @@ def clear_unilevel_points(body: ClearUnilevelPointsReq):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"清除失败: {str(e)}")
+'''
+
+@router.get("/points/summary", response_model=UserPointsSummaryResponse, summary="查询用户点数汇总（累计/已用/剩余）")
+def get_points_summary(
+    user_id: int = Query(..., description="用户ID", gt=0)
+):
+    """
+    查询用户的点数完整信息：
+    - 四个渠道的累计获得点数
+    - 累计总值（四个渠道之和）
+    - 剩余可用点数（true_total_points）
+    - 已使用点数（累计 - 剩余）
+    """
+    try:
+        summary = UserService.get_points_summary(user_id)
+        return summary
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")

@@ -197,7 +197,7 @@ class UnilevelPromoteResponse(BaseModel):
     """联创晋升响应"""
     new_level: int = Field(..., description="晋升后的等级")
     message: str = Field(..., description="提示信息")
-
+'''
 class UserSpecialPointsResponse(BaseModel):
     """团队和推荐点数查询响应"""
     team_reward_points: float = Field(..., description="团队奖励专用点数", example=89.1234)
@@ -209,7 +209,7 @@ class UserSubsidyPointsResponse(BaseModel):
 class UserUnilevelPointsResponse(BaseModel):
     """联创星级专用点数查询响应"""
     unilevel_points: float = Field(..., description="联创星级专用点数", example=9876.5432)
-
+'''
 class UserAllPointsResponse(BaseModel):
     """用户所有点数查询响应"""
     unilevel_points: float = Field(..., description="联创星级专用点数", example=9876.5432)
@@ -217,7 +217,7 @@ class UserAllPointsResponse(BaseModel):
     team_reward_points: float = Field(..., description="团队奖励专用点数", example=89.1234)
     referral_points: float = Field(..., description="推荐奖励专用点数", example=45.6789)
     total_points: float = Field(..., description="四个点数总和", example=11245.9133)
-
+'''
 class ClearRewardPointsReq(BaseModel):
     """清除奖励点数请求"""
     user_id: int = Field(..., description="用户ID", gt=0)
@@ -235,4 +235,17 @@ class ClearUnilevelPointsReq(BaseModel):
     user_id: int = Field(..., description="用户ID", gt=0)
     admin_key: str = Field(..., description="后台口令")
     reason: str = Field("后台清除", description="操作原因")
+'''
 
+class UserPointsSummaryResponse(BaseModel):
+    """用户点数汇总查询响应"""
+    # 四个获取渠道（累计获得）
+    unilevel_points: float = Field(..., description="联创星级-累计获得", example=10000.00)
+    subsidy_points: float = Field(..., description="周补贴-累计获得", example=5000.00)
+    team_reward_points: float = Field(..., description="团队奖励-累计获得", example=2000.00)
+    referral_points: float = Field(..., description="推荐奖励-累计获得", example=1000.00)
+
+    # 汇总数据
+    cumulative_total: float = Field(..., description="累计总值（四个渠道之和）", example=18000.00)
+    remaining_points: float = Field(..., description="剩余点数（true_total_points）", example=11000.00)
+    used_points: float = Field(..., description="已使用点数", example=7000.00)
