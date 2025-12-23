@@ -250,14 +250,14 @@ class FinanceService:
             (new_level, user_id)
         )
 
-        # 关键修改：按实付金额发放积分（而非原价）
-        points_earned = final_amount  # ← 修改为实付金额
+        # 关键修改：按实付金额发放积分
+        points_earned = final_amount
         cur.execute(
             "UPDATE users SET member_points = member_points + %s WHERE id = %s",
             (points_earned, user_id)
         )
 
-        # 记录积分日志（保持不变）
+        # 记录积分日志
         cur.execute(
             """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
                VALUES (%s, %s, (SELECT member_points FROM users WHERE id = %s), 
@@ -266,15 +266,29 @@ class FinanceService:
         )
         logger.debug(f"用户升级: {old_level}星 → {new_level}星, 获得积分: {points_earned:.4f}")
 
-        # 发放推荐和团队奖励（保持不变）
+        # 发放推荐和团队奖励
         self._create_pending_rewards_v2(cur, order_id, user_id, old_level, new_level)
 
-        # 公司积分池（保持不变）
+        # ==================== 关键修复：公司积分池增加 + 写入流水 ====================
         company_points = total_amount * Decimal('0.20')
         cur.execute(
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
             (company_points,)
         )
+
+        # 新增：查询更新后的余额
+        cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
+        new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+
+        # 新增：插入流水记录
+        cur.execute(
+            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+               flow_type, remark, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+            ('company_points', PLATFORM_MERCHANT_ID, company_points,
+             new_balance, 'income', f"会员订单#{order_id} 公司积分（销售金额¥{total_amount:.2f}的20%）")
+        )
+        logger.debug(f"公司积分池增加: {company_points:.4f}（已写入流水）")
 
     # ==================== 普通订单处理（v2版本） ====================
     def _process_normal_order_v2(self, cur, order_id: int, user_id: int, merchant_id: int,
@@ -341,21 +355,52 @@ class FinanceService:
 
     # ==================== 资金池分配（v2版本） ====================
     def _allocate_funds_to_pools_v2(self, cur, order_id: int, total_amount: Decimal) -> None:
-        """资金池分配（v2：接受cursor参数）"""
+        """资金池分配（v2：修复版，为所有池子写入流水）"""
         platform_revenue = total_amount * Decimal('0.80')
+
+        # 更新平台收入池余额
         cur.execute(
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'platform_revenue_pool'",
             (platform_revenue,)
         )
 
+        # ==================== 关键修复：查询余额并写入流水 ====================
+        cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'platform_revenue_pool'")
+        new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+
+        cur.execute(
+            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+               flow_type, remark, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+            ('platform_revenue_pool', PLATFORM_MERCHANT_ID, platform_revenue,
+             new_balance, 'income', f"会员订单#{order_id} 平台收入¥{platform_revenue:.2f}")
+        )
+        logger.debug(f"平台收入池增加: {platform_revenue:.4f}（已写入流水）")
+
+        # 分配其他资金池（公益基金、周补贴池等）
         for purpose, percent in ALLOCATIONS.items():
             if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
                 continue
             alloc_amount = total_amount * percent
+
+            # 更新池子余额
             cur.execute(
                 "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
                 (alloc_amount, purpose.value)
             )
+
+            # ==================== 关键修复：为每个池子写入流水 ====================
+            cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (purpose.value,))
+            new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+
+            cur.execute(
+                """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                   flow_type, remark, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                (purpose.value, PLATFORM_MERCHANT_ID, alloc_amount,
+                 new_balance, 'income', f"会员订单#{order_id} {purpose.value}池¥{alloc_amount:.2f}")
+            )
+            logger.debug(f"池子 {purpose.value} 增加: {alloc_amount:.4f}（已写入流水）")
 
     # ==================== 创建待发放奖励（v2版本） ====================
     def _create_pending_rewards_v2(self, cur, order_id: int, buyer_id: int,
@@ -1193,47 +1238,32 @@ class FinanceService:
                                   remark=remark,
                                   account_id=account_id)
 
-    def _insert_account_flow(self, account_type: str, related_user: Optional[int],
+    def _insert_account_flow(self, cur, account_type: str, related_user: Optional[int],
                              change_amount: Decimal, flow_type: str,
                              remark: str, account_id: Optional[int] = None) -> None:
-        """在 `account_flow` 中插入流水，并通过 `_get_balance_after` 计算插入时的余额。
-        该函数应在事务上下文中调用（不负责提交/回滚）。"""
-        balance_after = self._get_balance_after(account_type, related_user)
-        self.session.execute(
+        """插入流水记录（必须使用同一个cur）"""
+        balance_after = self._get_balance_after(cur, account_type, related_user)  # 传cur
+        cur.execute(
             """INSERT INTO account_flow (account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""",
-            {
-                "account_id": account_id,
-                "account_type": account_type,
-                "related_user": related_user,
-                "change_amount": change_amount,
-                "balance_after": balance_after,
-                "flow_type": flow_type,
-                "remark": remark
-            }
+            (account_id, account_type, related_user, change_amount, balance_after, flow_type, remark)
         )
 
-    def _add_pool_balance(self, account_type: str, amount: Decimal, remark: str,
+    def _add_pool_balance(self, cur, account_type: str, amount: Decimal, remark: str,
                           related_user: Optional[int] = None) -> Decimal:
-        """对平台/池子类账户 (`finance_accounts`) 增减余额并记录流水。
-        返回更新后的余额（Decimal）。"""
-        self.session.execute(
+        """对平台/池子类账户增减余额并记录流水"""
+        cur.execute(
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
-            {"amount": amount, "type": account_type}
+            (amount, account_type)
         )
-        result = self.session.execute(
-            "SELECT balance FROM finance_accounts WHERE account_type = %s",
-            {"type": account_type}
-        )
-        row = result.fetchone()
-        balance_after = Decimal(str(row.balance)) if row else Decimal('0')
-        # 记录流水（income/expense 由 amount 正负决定）
+
+        cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+        row = cur.fetchone()
+        balance_after = Decimal(str(row['balance'] if row and row['balance'] is not None else 0))
+
         flow_type = 'income' if amount >= 0 else 'expense'
-        self._insert_account_flow(account_type=account_type,
-                                  related_user=related_user,
-                                  change_amount=amount,
-                                  flow_type=flow_type,
-                                  remark=remark)
+        self._insert_account_flow(cur, account_type=account_type, related_user=related_user,
+                                  change_amount=amount, flow_type=flow_type, remark=remark)
         return balance_after
 
     # 关键修改：points_log插入支持DECIMAL(12,4)精度
