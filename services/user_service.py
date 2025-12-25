@@ -403,34 +403,86 @@ class UserService:
     @staticmethod
     def _calculate_unilevel_target(uid: int) -> int:
         """
-        计算用户应得的联创等级（核心逻辑）
+        计算用户应得的联创等级（满足所有ABCD条件）
         返回值：0=未获得, 1=一星, 2=二星, 3=三星
         """
         if UserService.get_level(uid) != 6:
             return 0
 
-        # 获取前7条直推线（按注册顺序）
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # B条件：获取前7条直推线
                 cur.execute(
                     "SELECT user_id FROM user_referrals "
                     "WHERE referrer_id=%s ORDER BY created_at LIMIT 7",
                     (uid,),
                 )
                 lines = [r["user_id"] for r in cur.fetchall()]
+                direct_count = len(lines)
 
-                # 统计每条线是否满足条件（用单SQL优化）
+                # C条件：统计有效线数（每条线有1个六星直推3个六星）
                 valid_lines = UserService._count_valid_lines(cur, lines)
 
-                # 正确的业务逻辑：满足条件的线数 ≥ 要求线数
-                if valid_lines >= 7:
-                    return 3  # 联创三星
-                elif valid_lines >= 5:
-                    return 2  # 联创二星
-                elif valid_lines >= 3:
-                    return 1  # 联创一星
+                # D条件1：团队整体累计六星数量（仅一星需要）
+                cur.execute(
+                    """
+                    WITH RECURSIVE team AS (
+                        SELECT id, 0 AS layer FROM users WHERE id=%s
+                        UNION ALL
+                        SELECT r.user_id, t.layer + 1
+                        FROM user_referrals r
+                        JOIN team t ON t.id = r.referrer_id
+                        WHERE t.layer < 6
+                    )
+                    SELECT COUNT(DISTINCT t.id) as total_6stars
+                    FROM team t
+                    JOIN users u ON u.id = t.id
+                    WHERE u.member_level = 6
+                    """,
+                    (uid,),
+                )
+                total_6star_count = cur.fetchone()['total_6stars'] or 0
 
-        return 0
+                # D条件2：每条线的六星数量（二星/三星需要）
+                lines_6star_counts = []
+                for line_id in lines:
+                    cur.execute(
+                        """
+                        WITH RECURSIVE team_line AS (
+                            SELECT id, 0 AS layer FROM users WHERE id=%s
+                            UNION ALL
+                            SELECT r.user_id, tl.layer + 1
+                            FROM user_referrals r
+                            JOIN team_line tl ON tl.id = r.referrer_id
+                            WHERE tl.layer < 6
+                        )
+                        SELECT COUNT(DISTINCT tl.id) as line_6stars
+                        FROM team_line tl
+                        JOIN users u ON u.id = tl.id
+                        WHERE u.member_level = 6
+                        """,
+                        (line_id,),
+                    )
+                    count = cur.fetchone()['line_6stars'] or 0
+                    lines_6star_counts.append(count)
+
+                # ======= 晋升判断（按星级从高到低）=======
+
+                # 三星：7条直推 + 7条有效(C) + 7条每条≥10名六星(D)
+                if direct_count >= 7 and valid_lines >= 7 and \
+                        all(count >= 10 for count in lines_6star_counts[:7]):
+                    return 3
+
+                # 二星：5条直推 + 5条有效(C) + 5条每条≥10名六星(D)
+                elif direct_count >= 5 and valid_lines >= 5 and \
+                        all(count >= 10 for count in lines_6star_counts[:5]):
+                    return 2
+
+                # 一星：3条直推 + 3条有效(C) + 团队累计≥30名六星(D)
+                elif direct_count >= 3 and valid_lines >= 3 and total_6star_count >= 30:
+                    return 1
+
+                return 0
 
     @staticmethod
     def _count_valid_lines(cur, line_ids: List[int]) -> int:

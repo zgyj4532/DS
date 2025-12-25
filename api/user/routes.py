@@ -841,6 +841,152 @@ def return_addr_get(mobile: str):
                 _err("未设置退货地址")
             return addr
 
+
+# ========== 新增：平台退货地址接口 ==========
+
+@router.get("/address/platform-return", summary="查询平台退货地址（公开）")
+def get_platform_return_address():
+    """
+    所有用户都能查看的平台退货地址
+    无需登录认证
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 查询 user_id=0 的平台退货地址
+            cur.execute("""
+                SELECT id, name, phone, province, city, district, detail, 
+                       is_default, addr_type, created_at, updated_at
+                FROM addresses 
+                WHERE user_id = 0 AND addr_type = 'return'
+                ORDER BY is_default DESC, id DESC
+                LIMIT 1
+            """)
+            addr = cur.fetchone()
+
+            if not addr:
+                raise HTTPException(status_code=404, detail="平台退货地址尚未设置")
+
+            return {
+                "id": addr["id"],
+                "name": addr["name"],
+                "phone": addr["phone"],
+                "province": addr["province"],
+                "city": addr["city"],
+                "district": addr["district"],
+                "detail": addr["detail"],
+                "is_default": bool(addr["is_default"])
+            }
+
+
+@router.get("/address/platform-return", summary="查询平台退货地址（公开）")
+def get_platform_return_address():
+    """
+    所有用户都能查看的平台退货地址
+    无需登录认证
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 查询 user_id=0 的平台退货地址
+            cur.execute("""
+                SELECT id, name, phone, province, city, district, detail, 
+                       is_default, addr_type, created_at, updated_at
+                FROM addresses 
+                WHERE user_id = 0 AND addr_type = 'return'
+                ORDER BY is_default DESC, id DESC
+                LIMIT 1
+            """)
+            addr = cur.fetchone()
+
+            if not addr:
+                raise HTTPException(status_code=404, detail="平台退货地址尚未设置")
+
+            return {
+                "id": addr["id"],
+                "name": addr["name"],
+                "phone": addr["phone"],
+                "province": addr["province"],
+                "city": addr["city"],
+                "district": addr["district"],
+                "detail": addr["detail"],
+                "is_default": bool(addr["is_default"])
+            }
+
+
+@router.post("/admin/platform-return-address", summary="设置平台退货地址（管理员）")
+def set_platform_return_address(
+        name: str = Query(..., description="收货人姓名"),
+        phone: str = Query(..., description="联系电话"),
+        province: str = Query(..., description="省份"),
+        city: str = Query(..., description="城市"),
+        district: str = Query(..., description="区县"),
+        detail: str = Query(..., description="详细地址"),
+        admin_key: str = Query(..., description="后台口令")
+):
+    if admin_key != "admin2025":
+        raise HTTPException(status_code=403, detail="后台口令错误")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # ==================== 新增：临时禁用外键检查 ====================
+            cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+            # ============================================================
+
+            # 查询是否已存在平台地址
+            cur.execute("""
+                SELECT id FROM addresses 
+                WHERE user_id = 0 AND addr_type = 'return'
+            """)
+            existing = cur.fetchone()
+
+            # 准备数据（user_id固定为0）
+            data = {
+                "user_id": 0,
+                "name": name,
+                "phone": phone,
+                "province": province,
+                "city": city,
+                "district": district,
+                "detail": detail,
+                "is_default": True,
+                "addr_type": "return"
+            }
+
+            if existing:
+                # 更新现有地址
+                addr_id = existing["id"]
+                sql = """
+                    UPDATE addresses 
+                    SET name=%s, phone=%s, province=%s, city=%s, 
+                        district=%s, detail=%s, updated_at=NOW()
+                    WHERE id=%s
+                """
+                cur.execute(sql, (
+                    data["name"], data["phone"], data["province"],
+                    data["city"], data["district"], data["detail"], addr_id
+                ))
+            else:
+                # 插入新地址
+                sql = """
+                    INSERT INTO addresses 
+                    (user_id, name, phone, province, city, district, 
+                     detail, is_default, addr_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                cur.execute(sql, (
+                    data["user_id"], data["name"], data["phone"],
+                    data["province"], data["city"], data["district"],
+                    data["detail"], data["is_default"], data["addr_type"]
+                ))
+
+            # ==================== 新增：重新启用外键检查 ====================
+            cur.execute("SET FOREIGN_KEY_CHECKS = 1")
+            conn.commit()
+            # ============================================================
+
+            return {"msg": "平台退货地址已设置/更新"}
+
+
+
 # 积分模块
 @router.post("/points", summary="增减积分")
 def points(body: PointsReq):
