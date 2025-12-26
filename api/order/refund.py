@@ -28,30 +28,68 @@ class RefundManager:
                 return True
 
     @staticmethod
-    def audit(order_number: str, approve: bool = True, reject_reason: Optional[str] = None) -> bool:
+    def audit(
+        order_number: str,
+        approve: bool = True,
+        reject_reason: Optional[str] = None,
+        merchant_address: Optional[str] = None
+    ) -> bool:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                new_status = "refund_success" if approve else "rejected"
+
+                # 1️⃣ 查询退款类型
                 cur.execute(
-                    "UPDATE refunds SET status=%s, reject_reason=%s WHERE order_number=%s",
-                    (new_status, reject_reason, order_number)
+                    "SELECT refund_type FROM refunds WHERE order_number=%s",
+                    (order_number,)
                 )
+                row = cur.fetchone()
+                if not row:
+                    return False
+
+                refund_type = row["refund_type"]
+
+                # 2️⃣ 仅「同意 + 退货退款」才强制要求地址
+                if approve and refund_type == "return_refund":
+                    if not merchant_address:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="同意退货退款时必须填写商家地址"
+                        )
+
+                new_status = "refund_success" if approve else "rejected"
+
+                # 3️⃣ 更新 refunds
+                cur.execute(
+                    """
+                    UPDATE refunds
+                    SET status=%s,
+                        reject_reason=%s,
+                        merchant_address=%s
+                    WHERE order_number=%s
+                    """,
+                    (new_status, reject_reason, merchant_address, order_number)
+                )
+
                 if cur.rowcount == 0:
                     return False
 
-                # 统一回写 refund_status
+                # 4️⃣ 回写订单退款状态
                 cur.execute(
                     "UPDATE orders SET refund_status=%s WHERE order_number=%s",
                     (new_status, order_number)
                 )
 
                 if approve:
-                    # 同意退款 → 订单状态改为 refund 并资金回滚
-                    cur.execute("UPDATE orders SET status='refund' WHERE order_number=%s", (order_number,))
+                    cur.execute(
+                        "UPDATE orders SET status='refund' WHERE order_number=%s",
+                        (order_number,)
+                    )
                     reverse_split_on_refund(order_number)
                 else:
-                    # 拒绝退款 → 订单直接完成
-                    cur.execute("UPDATE orders SET status='completed' WHERE order_number=%s", (order_number,))
+                    cur.execute(
+                        "UPDATE orders SET status='completed' WHERE order_number=%s",
+                        (order_number,)
+                    )
 
                 conn.commit()
                 return True
@@ -79,6 +117,12 @@ class RefundAudit(BaseModel):
     approve: bool
     reject_reason: Optional[str] = None
 
+class RefundAudit(BaseModel):
+    order_number: str
+    approve: bool
+    reject_reason: Optional[str] = None
+    merchant_address: Optional[str] = None
+
 @router.post("/apply", summary="申请退款")
 def refund_apply(body: RefundApply):
     ok = RefundManager.apply(body.order_number, body.refund_type, body.reason_code)
@@ -88,7 +132,12 @@ def refund_apply(body: RefundApply):
 
 @router.post("/audit", summary="审核退款申请")
 def refund_audit(body: RefundAudit):
-    RefundManager.audit(body.order_number, body.approve, body.reject_reason)
+    RefundManager.audit(
+        body.order_number,
+        body.approve,
+        body.reject_reason,
+        body.merchant_address
+    )
     return {"ok": True}
 
 @router.get("/progress/{order_number}", summary="查询退款进度")
