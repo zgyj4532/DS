@@ -59,6 +59,43 @@ async def init_database(db_manager: DatabaseManager = Depends(get_database_manag
         logger.error(f"数据库初始化失败: {e}")
         raise HTTPException(status_code=500, detail=f"初始化失败: {e}")
 
+@router.get("/api/subsidy/points-value", response_model=ResponseModel, summary="查询当前积分值")
+async def get_current_points_value(
+    service: FinanceService = Depends(get_finance_service)
+):
+    """查询当前周补贴积分值配置（包括手动调整和自动计算值）"""
+    try:
+        data = service.get_current_points_value()
+        return ResponseModel(
+            success=True,
+            message="查询成功",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询积分值失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+@router.post("/api/subsidy/points-value/adjust", response_model=ResponseModel, summary="调整积分值")
+async def adjust_subsidy_points_value(
+        points_value: Optional[float] = Query(None, ge=0, le=0.02,
+                                              description="积分值（0-0.02），不传或传null取消手动调整"),
+        auto_clear: bool = Query(True, description="是否在发放一次后自动清除，默认为true"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """手动调整周补贴积分值（平台决策）"""
+    try:
+        success = service.adjust_subsidy_points_value(points_value, auto_clear)
+
+        if points_value is None:
+            message = "已取消积分值手动调整，恢复自动计算"
+        else:
+            message = f"周补贴积分值已调整为: {points_value:.4f}（{points_value * 100:.2f}%），auto_clear={auto_clear}"
+
+        return ResponseModel(success=True, message=message)
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"调整积分值失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 @router.post("/api/subsidy/distribute", response_model=ResponseModel, summary="发放周补贴")
 async def distribute_subsidy(
         service: FinanceService = Depends(get_finance_service)

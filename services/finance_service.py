@@ -923,16 +923,125 @@ class FinanceService:
 
                 return result
 
-    # 完整替换 services/finance_service.py 中的 distribute_weekly_subsidy 方法
+    def _get_adjusted_points_value(self) -> Optional[Dict[str, Any]]:
+        """获取手动调整的积分值配置，返回包含 value 和 auto_clear 的字典"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT config_params FROM finance_accounts WHERE account_type = 'subsidy_pool'"
+                    )
+                    row = cur.fetchone()
+
+                    if row and row.get('config_params'):
+                        try:
+                            import json
+                            config = json.loads(row['config_params']) if isinstance(row['config_params'], str) else row[
+                                'config_params']
+
+                            if isinstance(config, dict) and 'points_value' in config:
+                                value = Decimal(str(config['points_value']))
+                                auto_clear = config.get('auto_clear', False)
+                                if 0 <= value <= MAX_POINTS_VALUE:
+                                    return {
+                                        'value': value,
+                                        'auto_clear': auto_clear
+                                    }
+                        except:
+                            pass
+        except Exception as e:
+            logger.error(f"获取积分值配置失败: {e}")
+        return None
+
+    def adjust_subsidy_points_value(self, points_value: Optional[float] = None, auto_clear: bool = False) -> bool:
+        """
+        手动调整周补贴积分值
+
+        Args:
+            points_value: 积分值（0-0.02），传入None表示取消手动调整，恢复自动计算
+            auto_clear: 是否在发放一次后自动清除（默认为False，不自动清除）
+        """
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if points_value is None:
+                        # 取消调整
+                        cur.execute(
+                            "UPDATE finance_accounts SET config_params = NULL WHERE account_type = 'subsidy_pool'"
+                        )
+                        logger.info("已取消周补贴积分值手动调整，恢复自动计算")
+                    else:
+                        # 设置调整值
+                        value = Decimal(str(points_value))
+                        if value < 0 or value > MAX_POINTS_VALUE:
+                            raise FinanceException(f"积分值必须在0到{MAX_POINTS_VALUE}之间")
+
+                        import json
+                        config = json.dumps({"points_value": str(value), "auto_clear": auto_clear})
+                        cur.execute(
+                            "UPDATE finance_accounts SET config_params = %s WHERE account_type = 'subsidy_pool'",
+                            (config,)
+                        )
+
+                        logger.info(f"已设置周补贴积分值手动调整: {value:.4f}，auto_clear={auto_clear}")
+
+                    conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"调整积分值失败: {e}")
+            raise
+
+    def get_current_points_value(self) -> Dict[str, Any]:
+        """查询当前积分值配置"""
+        # 检查是否有手动调整
+        adjusted_config = self._get_adjusted_points_value()
+
+        # 获取补贴池余额和总积分
+        pool_balance = self.get_account_balance('subsidy_pool')
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT SUM(COALESCE(member_points, 0)) as total FROM users")
+                total_member_points = Decimal(str(cur.fetchone()['total'] or 0))
+
+        # 自动计算值
+        auto_value = pool_balance / total_member_points if total_member_points > 0 else Decimal('0')
+        if auto_value > MAX_POINTS_VALUE:
+            auto_value = MAX_POINTS_VALUE
+
+        if adjusted_config:
+            current_value = adjusted_config['value']
+            is_manual_adjusted = True
+            manual_value = float(adjusted_config['value'])
+            auto_clear = adjusted_config.get('auto_clear', False)
+        else:
+            current_value = auto_value
+            is_manual_adjusted = False
+            manual_value = None
+            auto_clear = False
+
+        return {
+            "current_value": float(current_value),
+            "is_manual_adjusted": is_manual_adjusted,
+            "manual_value": manual_value,
+            "auto_clear": auto_clear,
+            "auto_calculated_value": float(auto_value),
+            "subsidy_pool_balance": float(pool_balance),
+            "total_member_points": float(total_member_points),
+            "max_allowed_value": float(MAX_POINTS_VALUE),
+            "remark": "积分值 = 补贴池金额 ÷ 总积分，最高不超过0.02（2%）。如果设置了auto_clear=true，发放一次后会自动清除手动配置。"
+        }
 
     def distribute_weekly_subsidy(self) -> bool:
         """
         发放周补贴（增加 subsidy_points 并扣减 member_points）
 
-        关键修复：在扣减积分时同步写入 points_log 流水记录，
-        确保积分报表能正确显示周补贴导致的积分支出
-
-        新增：将扣除的积分转入公司积分账户池，并记录资金池流水
+        关键修复：
+        1. 在扣减积分时同步写入 points_log 流水记录
+        2. 将扣除的积分转入公司积分账户池，并记录资金池流水
+        3. 【新增】从 subsidy_pool 扣除发放的 subsidy_amount
+        4. 【新增】只扣除与发放点数等量的积分（不再是全部积分）
+        5. 【新增】支持手动积分值，发放后根据 auto_clear 标志自动清除
         """
         logger.info("周补贴发放开始（发放专用点数并扣减积分）")
 
@@ -951,15 +1060,23 @@ class FinanceService:
             logger.warning("❌ 总积分为0，无法发放补贴")
             return False
 
-        # 积分价值 = 补贴池金额 / 总积分，最高0.02
-        points_value = pool_balance / total_member_points
-        if points_value > MAX_POINTS_VALUE:
-            points_value = MAX_POINTS_VALUE
+        # 【关键修改】检查是否有手动调整的积分值
+        adjusted_config = self._get_adjusted_points_value()
+        if adjusted_config:
+            points_value = adjusted_config['value']
+            auto_clear = adjusted_config.get('auto_clear', False)
+            logger.info(f"使用手动调整的积分值: {points_value:.4f}")
+        else:
+            points_value = pool_balance / total_member_points
+            if points_value > MAX_POINTS_VALUE:
+                points_value = MAX_POINTS_VALUE
+            auto_clear = False
+            logger.info(f"积分价值自动计算: ¥{points_value:.4f}/分")
 
         logger.info(f"补贴池: ¥{pool_balance} | 总积分: {total_member_points} | 积分值: ¥{points_value:.4f}/分")
 
         total_distributed = Decimal('0')
-        total_points_deducted = Decimal('0')  # 新增：统计总扣除积分
+        total_points_deducted = Decimal('0')  # 统计总扣除积分
         today = datetime.now().date()
 
         try:
@@ -985,7 +1102,14 @@ class FinanceService:
                         if points_to_add <= Decimal('0'):
                             continue
 
-                        # ====== 核心修复：发放补贴点数 ======
+                        # 【关键修改1】只扣除与发放点数等量的积分（不再是全部积分）
+                        # 如果用户积分不足，则最多扣除到0
+                        points_to_deduct = min(points_to_add, member_points)
+
+                        if points_to_deduct <= Decimal('0'):
+                            continue
+
+                        # ====== 发放补贴点数 ======
                         new_subsidy_points = current_subsidy_points + points_to_add
                         cur.execute(
                             "UPDATE users SET subsidy_points = %s WHERE id = %s",
@@ -995,33 +1119,33 @@ class FinanceService:
                             "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
                             (points_to_add, user_id)
                         )
-                        # ====== 核心修复：扣减 member_points 并记录流水 ======
-                        # 1. 扣减积分
+
+                        # ====== 扣减 member_points（等量扣除） ======
                         cur.execute(
                             "UPDATE users SET member_points = member_points - %s WHERE id = %s",
-                            (member_points, user_id)
+                            (points_to_deduct, user_id)
                         )
 
-                        # 2. 获取扣减后的余额
+                        # 获取扣减后的余额
                         cur.execute(
                             "SELECT member_points FROM users WHERE id = %s",
                             (user_id,)
                         )
                         new_balance = Decimal(str(cur.fetchone()['member_points'] or 0))
 
-                        # 3. 写入积分扣减流水（type='member' 表示会员积分，change_amount为负值）
+                        # 写入积分扣减流水
                         cur.execute(
                             """INSERT INTO points_log 
                                (user_id, change_amount, balance_after, type, reason, related_order, created_at)
                                VALUES (%s, %s, %s, 'member', %s, NULL, NOW())""",
-                            (user_id, -member_points, new_balance, f"周补贴扣减积分")
+                            (user_id, -points_to_deduct, new_balance, f"周补贴扣减积分")
                         )
 
-                        # ====== 新增：将扣除的积分转入公司积分池 ======
+                        # ====== 将扣除的积分转入公司积分池 ======
                         # 1. 增加公司积分池余额
                         cur.execute(
                             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
-                            (member_points,)
+                            (points_to_deduct,)
                         )
 
                         # 2. 获取更新后的公司积分池余额
@@ -1036,28 +1160,39 @@ class FinanceService:
                             """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
                                flow_type, remark, created_at)
                                VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                            ('company_points', user_id, member_points, company_balance, 'income',
-                             f"周补贴扣除积分转入 - 用户{user_id}扣除{member_points:.4f}分")
+                            ('company_points', user_id, points_to_deduct, company_balance, 'income',
+                             f"周补贴扣除积分转入 - 用户{user_id}扣除{points_to_deduct:.4f}分")
                         )
 
-                        # 4. 记录发放历史到 weekly_subsidy_records
+                        # 【新增】从 subsidy_pool 扣除发放的 subsidy_amount
+                        # 使用 _add_pool_balance 来统一处理余额更新和流水记录
+                        self._add_pool_balance(cur, 'subsidy_pool', -subsidy_amount,
+                                               f"周补贴发放 - 用户{user_id}获得{points_to_add:.4f}点数",
+                                               related_user=user_id)
+
+                        # 记录发放历史到 weekly_subsidy_records
                         cur.execute(
                             """INSERT INTO weekly_subsidy_records 
                                (user_id, week_start, subsidy_amount, points_before, points_deducted)
                                VALUES (%s, %s, %s, %s, %s)""",
-                            (user_id, today, subsidy_amount, member_points, points_to_add)
+                            (user_id, today, subsidy_amount, member_points, points_to_deduct)
                         )
 
                         total_distributed += subsidy_amount
-                        total_points_deducted += member_points  # 累加总扣除积分
+                        total_points_deducted += points_to_deduct
                         logger.info(
                             f"用户{user_id}: 发放补贴点数{points_to_add:.4f}, "
-                            f"扣减积分{member_points:.4f}, 余额{new_balance:.4f}, "
-                            f"转入公司积分池{member_points:.4f}"
+                            f"扣减积分{points_to_deduct:.4f}, 余额{new_balance:.4f}, "
+                            f"转入公司积分池{points_to_deduct:.4f}"
                         )
 
                     # 提交事务
                     conn.commit()
+
+            # 【新增】如果设置了 auto_clear=true，发放完成后自动清除手动配置
+            if auto_clear:
+                logger.info("发放完成，自动清除手动积分值配置")
+                self.adjust_subsidy_points_value(None)  # 清除配置
 
             logger.info(f"周补贴完成: 发放¥{total_distributed:.4f}等值点数，"
                         f"扣除积分{total_points_deducted:.4f}分，涉及{len(users)}个用户")
@@ -1328,7 +1463,24 @@ class FinanceService:
                              change_amount: Decimal, flow_type: str,
                              remark: str, account_id: Optional[int] = None) -> None:
         """插入流水记录（必须使用同一个cur）"""
-        balance_after = self._get_balance_after(cur, account_type, related_user)  # 传cur
+        # 修复：移除多余的 cur 参数，直接从 cur 查询余额
+        if related_user and account_type in ['promotion_balance', 'merchant_balance']:
+            # 查询用户余额字段
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="id=%s",
+                select_fields=[account_type]
+            )
+            cur.execute(select_sql, (related_user,))
+            row = cur.fetchone()
+            balance_after = Decimal(str(row.get(account_type, 0) or 0)) if row else Decimal('0')
+        else:
+            # 查询平台资金池余额
+            cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+            row = cur.fetchone()
+            balance_after = Decimal(str(row['balance'] if row and row['balance'] is not None else 0))
+
         cur.execute(
             """INSERT INTO account_flow (account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""",
@@ -2015,11 +2167,13 @@ class FinanceService:
         计算联创星级分红预览（展示每个权重的金额）
 
         返回：
-        - 资金池余额
+        - 资金池余额（扣除后的预估余额）
         - 总权重（所有联创星级之和）
         - 每个权重的自动计算金额
         - 是否设置了手动调整
         - 所有联创用户列表
+        - 【新增】estimated_balance_after: 扣除后的预估余额
+        - 【新增】total_required: 总发放金额
         """
         logger.info("计算联创星级分红预览")
 
@@ -2053,6 +2207,8 @@ class FinanceService:
                 "adjustment_configured": False,
                 "adjusted_amount": None,
                 "will_use_adjusted": False,
+                "estimated_balance_after": float(pool_balance),  # 无发放，余额不变
+                "total_required": 0.0,
                 "users": []
             }
 
@@ -2065,6 +2221,16 @@ class FinanceService:
         # 5. 检查是否有手动调整配置
         adjusted_amount = self._get_adjusted_unilevel_amount()
 
+        # 6. 预估扣除后的余额和总发放金额
+        if adjusted_amount is not None:
+            amount_per_weight = adjusted_amount
+            total_required = amount_per_weight * total_weight
+            estimated_balance_after = pool_balance - total_required
+        else:
+            amount_per_weight = amount_per_weight_auto
+            total_required = amount_per_weight * total_weight
+            estimated_balance_after = pool_balance - total_required
+
         return {
             "pool_balance": float(pool_balance),
             "total_weight": int(total_weight),
@@ -2073,6 +2239,8 @@ class FinanceService:
             "adjustment_configured": adjusted_amount is not None,
             "adjusted_amount": float(adjusted_amount) if adjusted_amount else None,
             "will_use_adjusted": adjusted_amount is not None,
+            "estimated_balance_after": float(estimated_balance_after),  # 新增
+            "total_required": float(total_required),  # 新增
             "users": [
                 {
                     "user_id": user['user_id'],
@@ -2134,7 +2302,8 @@ class FinanceService:
         2. 优先使用手动调整的金额
         3. 计算所需总额并检查余额
         4. 执行分红发放
-        5. 成功后清除手动调整配置
+        5. 【新增】从 honor_director 池扣除发放的 points_to_add
+        6. 成功后清除手动调整配置
         """
         logger.info("联创星级分红发放开始（检测手动调整配置）")
 
@@ -2219,6 +2388,12 @@ class FinanceService:
                             VALUES (%s, %s, %s, %s, %s, %s, NOW())
                         """, ('honor_director', user_id, points_to_add, 0, 'income',
                               f"联创{weight}星级分红（权重{weight}/{total_weight}）"))
+
+                        # 【新增】从 honor_director 池扣除发放的 points_to_add
+                        # 使用 _add_pool_balance 来统一处理余额更新和流水记录
+                        self._add_pool_balance(cur, 'honor_director', -points_to_add,
+                                               f"联创星级分红发放 - 用户{user_id}获得{points_to_add:.4f}点数",
+                                               related_user=user_id)
 
                         total_distributed += points_to_add
                         logger.debug(f"用户{user_id}获得联创星级分红: {points_to_add:.4f}点数")
@@ -3844,20 +4019,7 @@ class FinanceService:
                 }
 
     def get_weekly_subsidy_preview(self, year: int, week: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """周补贴预览报表（全用户）
-
-        查询所有用户在指定周的积分余额和预计可获得的周补贴优惠券金额
-        支持分页返回
-
-        Args:
-            year: 年份，如2025
-            week: 周数，1-53
-            page: 页码
-            page_size: 每页条数
-
-        Returns:
-            包含汇总统计、分页信息和用户明细列表的字典
-        """
+        """周补贴预览报表（全用户）"""
         logger.info(f"生成全用户周补贴预览报表: {year}年第{week}周，页码={page}")
 
         from datetime import date, timedelta
@@ -3905,13 +4067,20 @@ class FinanceService:
 
                 total_points = total_user_points + total_merchant_points + company_points
 
-                # 3. 计算积分价值
-                if total_points <= 0:
-                    points_value = Decimal('0')
+                # 3. 计算积分价值（先检查手动调整）
+                adjusted_points_value = self._get_adjusted_points_value()
+
+                if adjusted_points_value is not None:
+                    # 使用手动调整的积分值
+                    points_value = adjusted_points_value
+                    is_manual_adjusted = True
+                    logger.info(f"预览使用手动调整的积分值: {points_value:.4f}")
                 else:
-                    points_value = pool_balance / total_points
+                    # 按原方案自动计算
+                    points_value = pool_balance / total_points if total_points > 0 else Decimal('0')
                     if points_value > MAX_POINTS_VALUE:
                         points_value = MAX_POINTS_VALUE
+                    is_manual_adjusted = False
 
                 # 4. 查询所有有积分的用户（分页）
                 offset = (page - 1) * page_size
@@ -3941,7 +4110,7 @@ class FinanceService:
                         "user_id": user['id'],
                         "user_name": user['name'],
                         "member_points": float(user_points),
-                        "estimated_coupon_amount": float(estimated_coupon),
+                        "estimated_points_amount": float(estimated_coupon),
                         "points_percentage": float(user_points / total_points * 100) if total_points > 0 else 0.0
                     })
 
@@ -3957,7 +4126,8 @@ class FinanceService:
                         "subsidy_pool_balance": float(pool_balance),
                         "total_system_points": float(total_points),
                         "points_value_per_point": float(points_value),
-                        "max_points_value_applied": points_value >= MAX_POINTS_VALUE
+                        "max_points_value_applied": points_value >= MAX_POINTS_VALUE,
+                        "is_manual_adjusted": is_manual_adjusted  # 新增：是否手动调整
                     },
                     "pagination": {
                         "page": page,
@@ -3974,7 +4144,6 @@ class FinanceService:
                     "remark": "按member_points降序排列，支持分页查询"
                 }
 
-    # 替换 services/finance_service.py 中的 get_order_points_flow_report 方法
 
     def get_order_points_flow_report(self, start_date: str, end_date: str,
                                      user_id: Optional[int] = None,
