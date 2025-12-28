@@ -1168,7 +1168,7 @@ class FinanceService:
                         # 使用 _add_pool_balance 来统一处理余额更新和流水记录
                         self._add_pool_balance(cur, 'subsidy_pool', -subsidy_amount,
                                                f"周补贴发放 - 用户{user_id}获得{points_to_add:.4f}点数",
-                                               related_user=user_id)
+                                               related_user=None)
 
                         # 记录发放历史到 weekly_subsidy_records
                         cur.execute(
@@ -2183,20 +2183,31 @@ class FinanceService:
         # 2. 查询所有联创用户
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # === 关键修复：使用 JOIN + BETWEEN 替代 EXISTS ===
+                cur.execute("SET time_zone = '+08:00'")
+
+                # 1. 查询分红池余额
+                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'honor_director'")
+                row = cur.fetchone()
+                pool_balance = Decimal(str(row['balance'] if row and row['balance'] is not None else 0))
+
+                # 2. ✅ 修正查询：使用 INNER JOIN + GROUP BY
                 cur.execute("""
                     SELECT uu.user_id, uu.level, u.name, u.member_level
                     FROM user_unilevel uu
                     JOIN users u ON uu.user_id = u.id
+                    INNER JOIN (
+                        SELECT DISTINCT o.user_id
+                        FROM orders o
+                        WHERE o.status IN ('pending_ship','pending_recv','completed')
+                          AND o.created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+                          AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+                    ) AS active_users ON uu.user_id = active_users.user_id
                     WHERE uu.level IN (1, 2, 3)
-                    AND EXISTS (
-                        SELECT 1 FROM orders o
-                        WHERE o.user_id = uu.user_id
-                          AND o.status IN ('pending_ship','pending_recv','completed')
-                          AND o.created_at >= DATE_FORMAT(CURDATE(), '%%Y-%%m-01')
-                          AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%%Y-%%m-01'), INTERVAL 1 MONTH)
-                    )
                 """)
                 unilevel_users = cur.fetchall()
+
+                logger.error(f"=== DEBUG: 联创用户数={len(unilevel_users)}，数据={unilevel_users}")
 
         if not unilevel_users:
             return {
@@ -2310,18 +2321,21 @@ class FinanceService:
         # 查询所有联创用户
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # === 使用相同的 JOIN 查询 ===
+                cur.execute("SET time_zone = '+08:00'")
+
                 cur.execute("""
                     SELECT uu.user_id, uu.level, u.name, u.member_level
                     FROM user_unilevel uu
                     JOIN users u ON uu.user_id = u.id
+                    INNER JOIN (
+                        SELECT DISTINCT o.user_id
+                        FROM orders o
+                        WHERE o.status IN ('pending_ship','pending_recv','completed')
+                          AND o.created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+                          AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+                    ) AS active_users ON uu.user_id = active_users.user_id
                     WHERE uu.level IN (1, 2, 3)
-                    AND EXISTS (
-                        SELECT 1 FROM orders o
-                        WHERE o.user_id = uu.user_id
-                          AND o.status IN ('pending_ship','pending_recv','completed')
-                          AND o.created_at >= DATE_FORMAT(CURDATE(), '%%Y-%%m-01')
-                          AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%%Y-%%m-01'), INTERVAL 1 MONTH)
-                    )
                 """)
                 unilevel_users = cur.fetchall()
 
@@ -2393,7 +2407,7 @@ class FinanceService:
                         # 使用 _add_pool_balance 来统一处理余额更新和流水记录
                         self._add_pool_balance(cur, 'honor_director', -points_to_add,
                                                f"联创星级分红发放 - 用户{user_id}获得{points_to_add:.4f}点数",
-                                               related_user=user_id)
+                                               related_user=None)
 
                         total_distributed += points_to_add
                         logger.debug(f"用户{user_id}获得联创星级分红: {points_to_add:.4f}点数")
@@ -3075,87 +3089,115 @@ class FinanceService:
     def get_pool_flow_report(self, account_type: str,
                              start_date: str, end_date: str,
                              page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """
-        平台资金池变动明细报表
-
-        查询指定资金池的每一笔流水，包括收入、支出和余额变化
-
-        Args:
-            account_type: 资金池类型（如 'public_welfare', 'subsidy_pool' 等）
-            start_date: 开始日期 yyyy-MM-dd
-            end_date: 结束日期 yyyy-MM-dd
-            page: 页码
-            page_size: 每页条数
-
-        Returns:
-            包含汇总统计和流水明细的报表数据
-        """
         logger.info(f"生成资金池流水报表: 账户={account_type}, 日期范围={start_date}至{end_date}")
 
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # ==================== 查询平台余额（保持不变） ====================
+                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+                account_row = cur.fetchone()
+                actual_current_balance = Decimal(str(account_row['balance'] if account_row else 0))
+
+                # ==================== ✅ 智能过滤：只对 honor_director 强制过滤 ====================
+                where_conditions = [
+                    "account_type = %s",
+                    "DATE(created_at) BETWEEN %s AND %s"
+                ]
+                params = [account_type, start_date, end_date]
+
+                # 关键判断：只有联创分红池才过滤 related_user=NULL
+                # 其他池子（如 referral_points, team_reward_points）保留用户记录
+                if account_type == 'honor_director':
+                    where_conditions.append("related_user IS NULL")
+
+                # ==================== 后续查询逻辑（保持不变） ====================
+                where_sql = " AND ".join(where_conditions)
+
                 # 汇总统计
-                cur.execute("""
+                cur.execute(f"""
                     SELECT 
                         COUNT(*) as total_transactions,
                         SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
-                        SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense,
-                        MAX(balance_after) as ending_balance
+                        SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense
                     FROM account_flow
-                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
-                """, (account_type, start_date, end_date))
-
+                    WHERE {where_sql}
+                """, tuple(params))
                 summary = cur.fetchone()
 
                 # 总记录数
-                cur.execute("""
+                cur.execute(f"""
                     SELECT COUNT(*) as total 
                     FROM account_flow
-                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
-                """, (account_type, start_date, end_date))
+                    WHERE {where_sql}
+                """, tuple(params))
                 total_count = cur.fetchone()['total'] or 0
 
-                # 明细查询
+                # 明细查询（保持不变）
                 offset = (page - 1) * page_size
-                cur.execute("""
+                cur.execute(f"""
                     SELECT 
                         id, related_user, change_amount, balance_after, 
                         flow_type, remark, created_at
                     FROM account_flow
-                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
-                    ORDER BY created_at DESC
+                    WHERE {where_sql}
+                    ORDER BY created_at DESC, id DESC
                     LIMIT %s OFFSET %s
-                """, (account_type, start_date, end_date, page_size, offset))
-
+                """, tuple(params + [page_size, offset]))
                 records = cur.fetchall()
 
-                # 获取用户名称
+                # ==================== ✅ 获取用户名称（优化） ====================
                 def get_user_name(uid):
                     if not uid:
                         return "系统"
+                    if uid == 0:  # 平台商户ID
+                        return "平台"
                     try:
                         cur.execute("SELECT name FROM users WHERE id = %s", (uid,))
                         row = cur.fetchone()
-                        return row['name'] if row else "未知用户"
-                    except:
-                        return f"未知用户:{uid}"
+                        return row['name'] if row else f"未知用户:{uid}"
+                    except Exception:
+                        return f"查询失败:{uid}"
+
+                # ====================================================================
+
+                # ==================== ✅ 计算净变动 ====================
+                # 净变动 = 总收入 - 总支出（与流水表逻辑一致）
+                total_income = Decimal(str(summary['total_income'] or 0))
+                total_expense = Decimal(str(summary['total_expense'] or 0))
+                net_change = total_income - total_expense
+
+                # 验证数据一致性（可选，调试用）
+                # 当前余额 ≈ 期初余额 + 净变动（如果查询了期初余额）
+                # ====================================================================
+
+                # 账户类型中文名称映射
+                account_name_map = {
+                    "public_welfare": "公益基金",
+                    "subsidy_pool": "周补贴池",
+                    "honor_director": "荣誉董事分红池",
+                    "company_points": "公司积分池",
+                    "platform_revenue_pool": "平台收入池",
+                    "maintain_pool": "平台维护池",
+                    "director_pool": "荣誉董事池",
+                    "shop_pool": "社区店池",
+                    "city_pool": "城市运营中心池",
+                    "branch_pool": "大区分公司池",
+                    "fund_pool": "事业发展基金池",
+                    "merchant_balance": "商户余额池"
+                }
 
                 return {
                     "summary": {
                         "report_type": "pool_flow",
                         "account_type": account_type,
-                        "account_name": {
-                            "public_welfare": "公益基金",
-                            "subsidy_pool": "周补贴池",
-                            "honor_director": "荣誉董事分红池",
-                            "company_points": "公司积分池",
-                            "platform_revenue_pool": "平台收入池"
-                        }.get(account_type, account_type),
+                        "account_name": account_name_map.get(account_type, account_type),
                         "total_transactions": summary['total_transactions'] or 0,
-                        "total_income": float(summary['total_income'] or 0),
-                        "total_expense": float(summary['total_expense'] or 0),
-                        "net_change": float((summary['total_income'] or 0) - (summary['total_expense'] or 0)),
-                        "ending_balance": float(summary['ending_balance'] or 0)
+                        "total_income": float(total_income),
+                        "total_expense": float(total_expense),
+                        "net_change": float(net_change),
+                        # ✅ 修复：使用真实的当前余额
+                        "ending_balance": float(actual_current_balance),
+                        "query_date_range": f"{start_date} 至 {end_date}"
                     },
                     "pagination": {
                         "page": page,
@@ -3169,12 +3211,14 @@ class FinanceService:
                             "related_user": r['related_user'],
                             "user_name": get_user_name(r['related_user']),
                             "change_amount": float(r['change_amount']),
-                            "balance_after": float(r['balance_after']) if r['balance_after'] else None,
+                            "balance_after": float(r['balance_after']) if r['balance_after'] is not None else None,
                             "flow_type": r['flow_type'],
                             "remark": r['remark'],
                             "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
                         } for r in records
-                    ]
+                    ],
+                    "data_source": "finance_accounts + account_flow",  # 数据来源说明
+                    "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
     # ==================== 联创星级点数流水报表 ====================
     def get_unilevel_points_flow_report(self, user_id: Optional[int] = None,
@@ -5438,3 +5482,4 @@ def generate_statement():
                 (1, yesterday, opening, income, withdraw_amount, closing)
             )
             conn.commit()
+
