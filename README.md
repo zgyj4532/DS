@@ -1,27 +1,85 @@
-python main.py
+# 电商小程序后端api
 
-启动后，访问 http://127.0.0.1:8000/docs 查看 API 文档。
+## 启动前准备
 
-或者访问 http://127.0.0.1:8000/redoc 查看 ReDoc 文档。
+请先创建并配置 `.env` 文件在根目录中，示例如下：
 
-需要自己配置.env文件
-
-文件示例：
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306
 MYSQL_USER=root
 MYSQL_PASSWORD=password
-MYSQL_DATABASE=finan_manage_db
+MYSQL_DATABASE=sql_db
+---
 
-1.认真看项目结构说明文档!  认真看项目结构说明文档!  认真看项目结构说明文档！！ 你后面需要修改的部分实现功能的位置都在文档里面，添加功能后记得更新文档。
+## 运行 / 启动说明
 
-2.确定好共需要多少张表，每个部分需要几张表，表里面有什么内容，实现功能过程中禁止私自建表，如有需要，反映到组长由大家集中建表。database_setup中的内容任何人不得私自修改。
+- **Linux（systemd）**
 
-3.项目重构过程中有些功能已经缺失，大家先复现目前项目中已经存在的功能，未实现功能等复现完当下功能后再实现。
+	如果使用 systemd 管理服务，可按以下步骤操作：
 
-4.修改代码时需谨慎，确认好使用的技术栈，尽量不引入其他技术，尽可能不动他人负责的部分，如需改动需提前告知他人。
+	- 将服务单元文件 `ds.service` 放到 `/etc/systemd/system/`（如尚未部署服务单元）。
+	- 重新加载 systemd：
 
-5.记得保存自己的项目。
+		```bash
+		sudo systemctl daemon-reload
+		```
 
-6.有问题及时反映。
+	- 启动服务：
 
+		```bash
+		sudo systemctl start ds.service
+		```
+
+	- 重启服务（在更新后常用）：
+
+		```bash
+		sudo systemctl restart ds.service
+		```
+
+	- 查看服务状态：
+
+		```bash
+		sudo systemctl status ds.service
+		```
+
+	- 查看实时日志：
+
+		```bash
+		sudo journalctl -u ds.service -f
+		```
+
+- **Windows**
+
+	Windows 系统可使用 [uv](https://docs.astral.sh/uv/getting-started/installation/)（按项目约定的工具）运行与调试：
+
+	- 安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)（根据你使用的包管理器或安装方式）。
+	- 初始化虚拟环境：
+
+		```powershell
+		uv venv
+		```
+
+	- 根据 `pyproject.toml`（或项目的 .toml 配置）同步/安装依赖：
+
+		```powershell
+		uv sync
+		```
+
+	- 以调试/运行模式启动项目：
+
+		```powershell
+		uv run main.py
+		```
+
+保留说明
+启动后，访问 http://127.0.0.1:8000/docs 查看 API 文档。
+
+或者访问 http://127.0.0.1:8000/redoc 查看 ReDoc 文档。
+
+---
+
+## AI 辅助免责声明
+
+本项目在 AI/大型语言模型（包括 GitHub Copilot、ChatGPT 及相关工具）的协助下开发，受到了偶尔知道自己在做什么的人类的监督。
+
+---
