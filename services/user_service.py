@@ -411,14 +411,19 @@ class UserService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # B条件：获取前7条直推线
+                # ✅ 修复B条件：只获取六星直推
                 cur.execute(
-                    "SELECT user_id FROM user_referrals "
-                    "WHERE referrer_id=%s ORDER BY created_at LIMIT 7",
+                    """
+                    SELECT r.user_id 
+                    FROM user_referrals r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE r.referrer_id=%s AND u.member_level = 6
+                    ORDER BY r.created_at LIMIT 7
+                    """,
                     (uid,),
                 )
                 lines = [r["user_id"] for r in cur.fetchall()]
-                direct_count = len(lines)
+                direct_6star_count = len(lines)  # 直推六星数量（B条件）
 
                 # C条件：统计有效线数（每条线有1个六星直推3个六星）
                 valid_lines = UserService._count_valid_lines(cur, lines)
@@ -466,20 +471,24 @@ class UserService:
                     count = cur.fetchone()['line_6stars'] or 0
                     lines_6star_counts.append(count)
 
-                # ======= 晋升判断（按星级从高到低）=======
+                # 添加调试日志
+                logger.info(f"联创晋升计算 - 用户ID:{uid}, 直推六星:{direct_6star_count}, "
+                            f"有效线数:{valid_lines}, 各线六星数:{lines_6star_counts}, "
+                            f"团队总六星:{total_6star_count}")
 
-                # 三星：7条直推 + 7条有效(C) + 7条每条≥10名六星(D)
-                if direct_count >= 7 and valid_lines >= 7 and \
-                        all(count >= 10 for count in lines_6star_counts[:7]):
+                # ✅ 修复晋升判断：使用直推六星数而非直推总数
+                # 三星：7条直推六星 + 7条有效(C) + 7条每条≥10名六星(D)
+                if direct_6star_count >= 7 and valid_lines >= 7 and \
+                        len(lines) >= 7 and all(count >= 10 for count in lines_6star_counts[:7]):
                     return 3
 
-                # 二星：5条直推 + 5条有效(C) + 5条每条≥10名六星(D)
-                elif direct_count >= 5 and valid_lines >= 5 and \
-                        all(count >= 10 for count in lines_6star_counts[:5]):
+                # 二星：5条直推六星 + 5条有效(C) + 5条每条≥10名六星(D)
+                elif direct_6star_count >= 5 and valid_lines >= 5 and \
+                        len(lines) >= 5 and all(count >= 10 for count in lines_6star_counts[:5]):
                     return 2
 
-                # 一星：3条直推 + 3条有效(C) + 团队累计≥20名六星(D)
-                elif direct_count >= 3 and valid_lines >= 3 and total_6star_count >= 21:
+                # 一星：3条直推六星 + 3条有效(C) + 团队累计≥20名六星(D)
+                elif direct_6star_count >= 3 and valid_lines >= 3 and total_6star_count >= 21:
                     return 1
 
                 return 0
