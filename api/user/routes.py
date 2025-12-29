@@ -878,40 +878,6 @@ def get_platform_return_address():
             }
 
 
-@router.get("/address/platform-return", summary="查询平台退货地址（公开）")
-def get_platform_return_address():
-    """
-    所有用户都能查看的平台退货地址
-    无需登录认证
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # 查询 user_id=0 的平台退货地址
-            cur.execute("""
-                SELECT id, name, phone, province, city, district, detail, 
-                       is_default, addr_type, created_at, updated_at
-                FROM addresses 
-                WHERE user_id = 0 AND addr_type = 'return'
-                ORDER BY is_default DESC, id DESC
-                LIMIT 1
-            """)
-            addr = cur.fetchone()
-
-            if not addr:
-                raise HTTPException(status_code=404, detail="平台退货地址尚未设置")
-
-            return {
-                "id": addr["id"],
-                "name": addr["name"],
-                "phone": addr["phone"],
-                "province": addr["province"],
-                "city": addr["city"],
-                "district": addr["district"],
-                "detail": addr["detail"],
-                "is_default": bool(addr["is_default"])
-            }
-
-
 @router.post("/admin/platform-return-address", summary="设置平台退货地址（管理员）")
 def set_platform_return_address(
         name: str = Query(..., description="收货人姓名"),

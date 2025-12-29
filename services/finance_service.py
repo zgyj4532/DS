@@ -5,6 +5,7 @@
 # 3. merchant_points同步支持小数精度处理
 
 import logging
+import json
 from decimal import Decimal
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
@@ -252,8 +253,13 @@ class FinanceService:
                     )
                     logger.debug(f"用户{user_id}获得积分: +{normal_points_earned:.4f}")
 
-            # 9. 更新平台资金池（所有商品总金额×80%）
-            platform_revenue = final_amount * Decimal('0.80')
+            # 9. 更新平台资金池（使用动态配置的 merchant_balance）
+            try:
+                allocs = self.get_pool_allocations()
+                platform_revenue = final_amount * allocs.get('merchant_balance', Decimal('0.80'))
+            except Exception:
+                platform_revenue = final_amount * Decimal('0.80')
+
             cur.execute(
                 "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'platform_revenue_pool'",
                 (platform_revenue,)
@@ -271,28 +277,84 @@ class FinanceService:
                  new_balance, 'income', f"订单#{order_id} 平台收入¥{platform_revenue:.2f}")
             )
 
-            # 10. 分配其他资金池（公益基金、周补贴池等）
-            for purpose, percent in ALLOCATIONS.items():
-                if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
-                    continue
-                alloc_amount = final_amount * percent
+            # 公司积分池增加：基于订单总额扣除积分抵扣后的基数的20%
+            try:
+                company_base = total_amount - points_discount
+                if company_base < Decimal('0'):
+                    company_base = Decimal('0')
+                company_points = (company_base * Decimal('0.20')).quantize(Decimal('0.0001'))
 
                 cur.execute(
-                    "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
-                    (alloc_amount, purpose.value)
+                    "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
+                    (company_points,)
                 )
-
-                # 记录流水
-                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (purpose.value,))
-                new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", ('company_points',))
+                cp_row = cur.fetchone()
+                cp_new_balance = Decimal(str(cp_row['balance'] or 0))
 
                 cur.execute(
                     """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
                        flow_type, remark, created_at)
                        VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                    (purpose.value, PLATFORM_MERCHANT_ID, alloc_amount,
-                     new_balance, 'income', f"订单#{order_id} {purpose.value}池¥{alloc_amount:.2f}")
+                    ('company_points', PLATFORM_MERCHANT_ID, company_points, cp_new_balance, 'income', f"订单#{order_id} 公司积分池+20% ¥{company_points:.4f}")
                 )
+                logger.debug(f"公司积分池增加: ¥{company_points:.4f}（订单#{order_id}）")
+                # 在积分流水中记录公司积分池的变动（便于积分报表追踪）
+                try:
+                    cur.execute(
+                        "INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at) VALUES (%s, %s, %s, %s, %s, %s, NOW())",
+                        (PLATFORM_MERCHANT_ID, company_points, cp_new_balance, 'company', f"订单#{order_id} 公司积分池增加", order_id)
+                    )
+                except Exception as e:
+                    logger.debug(f"写入 points_log（公司积分池）失败: {e}")
+            except Exception as e:
+                logger.error(f"更新公司积分池失败: {e}")
+
+            # 10. 使用动态配置分配其他资金池（按 account_type 的 allocation）
+            try:
+                pools_cfg = allocs
+            except Exception:
+                pools_cfg = None
+
+            if pools_cfg:
+                for atype, ratio in pools_cfg.items():
+                    if atype == 'merchant_balance':
+                        continue
+                    try:
+                        alloc_amount = final_amount * ratio
+                        cur.execute(
+                            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
+                            (alloc_amount, atype)
+                        )
+                        cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (atype,))
+                        new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+                        cur.execute(
+                            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                               flow_type, remark, created_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                            (atype, PLATFORM_MERCHANT_ID, alloc_amount, new_balance, 'income', f"订单#{order_id} {atype}池¥{alloc_amount:.2f}")
+                        )
+                    except Exception as e:
+                        logger.error(f"动态分配到池子 {atype} 失败: {e}")
+            else:
+                # 回退到旧的 ALLOCATIONS 配置
+                for purpose, percent in ALLOCATIONS.items():
+                    if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
+                        continue
+                    alloc_amount = final_amount * percent
+                    cur.execute(
+                        "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
+                        (alloc_amount, purpose.value)
+                    )
+                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (purpose.value,))
+                    new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+                    cur.execute(
+                        """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                           flow_type, remark, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                        (purpose.value, PLATFORM_MERCHANT_ID, alloc_amount,
+                         new_balance, 'income', f"订单#{order_id} {purpose.value}池¥{alloc_amount:.2f}")
+                    )
 
             logger.debug(f"订单结算成功: ID={order_id}, 奖励基数¥{single_member_price}")
             return order_id
@@ -331,6 +393,14 @@ class FinanceService:
                       %s, %s, NOW())""",
             ('company_points', user_id, points_to_use, 'income', f"用户{user_id}积分抵扣转入")
         )
+        # 同步写入积分流水表，记录公司积分池的增加（设 user_id 为平台ID 以示系统入账）
+        try:
+            cur.execute(
+                "INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at) VALUES (%s, %s, (SELECT balance FROM finance_accounts WHERE account_type = 'company_points'), %s, %s, %s, NOW())",
+                (PLATFORM_MERCHANT_ID, points_to_use, 'company', f"用户{user_id}积分抵扣转入公司池", None)
+            )
+        except Exception as e:
+            logger.debug(f"写入 points_log（用户积分抵扣->公司池）失败: {e}")
 
     # ==================== 会员订单处理（v2版本） ====================
     # def _process_member_order_v2(self, cur, order_id: int, user_id: int, user,
@@ -447,7 +517,11 @@ class FinanceService:
     # ==================== 资金池分配（v2版本） ====================
     def _allocate_funds_to_pools_v2(self, cur, order_id: int, total_amount: Decimal) -> None:
         """资金池分配（v2：修复版，为所有池子写入流水）"""
-        platform_revenue = total_amount * Decimal('0.80')
+        # 读取运行时配置
+        allocs = self.get_pool_allocations()
+
+        # 商家/平台收入部分使用 merchant_balance
+        platform_revenue = total_amount * allocs.get('merchant_balance', Decimal('0.80'))
 
         # 更新平台收入池余额
         cur.execute(
@@ -468,44 +542,51 @@ class FinanceService:
         )
         logger.debug(f"平台收入池增加: {platform_revenue:.4f}（已写入流水）")
 
-        # 分配其他资金池（公益基金、周补贴池等）
-        for purpose, percent in ALLOCATIONS.items():
-            if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
+        # 使用动态配置按行分配到各池子（排除 merchant_balance）
+        for atype, ratio in allocs.items():
+            if atype == 'merchant_balance':
                 continue
-            alloc_amount = total_amount * percent
+            try:
+                alloc_amount = total_amount * ratio
 
-            # 更新池子余额
-            cur.execute(
-                "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
-                (alloc_amount, purpose.value)
-            )
+                # 确保对应的 finance_accounts 行存在
+                cur.execute(
+                    "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0) ON DUPLICATE KEY UPDATE account_name=VALUES(account_name)",
+                    (atype, atype)
+                )
 
-            # ==================== 关键修复：为每个池子写入流水 ====================
-            cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (purpose.value,))
-            new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+                cur.execute(
+                    "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
+                    (alloc_amount, atype)
+                )
 
-            cur.execute(
-                """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
-                   flow_type, remark, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                (purpose.value, PLATFORM_MERCHANT_ID, alloc_amount,
-                 new_balance, 'income', f"会员订单#{order_id} {purpose.value}池¥{alloc_amount:.2f}")
-            )
-            logger.debug(f"池子 {purpose.value} 增加: {alloc_amount:.4f}（已写入流水）")
+                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (atype,))
+                new_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+
+                cur.execute(
+                    """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                       flow_type, remark, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                    (atype, PLATFORM_MERCHANT_ID, alloc_amount, new_balance, 'income', f"会员订单#{order_id} {atype}池¥{alloc_amount:.2f}")
+                )
+                logger.debug(f"池子 {atype} 增加: {alloc_amount:.4f}（已写入流水）")
+            except Exception as e:
+                logger.error(f"分配到池子 {atype} 失败: {e}")
 
     def _create_pending_rewards_v2(self, cur, order_id: int, buyer_id: int,
                                    old_level: int, new_level: int,
                                    single_price: Decimal, total_quantity: int) -> None:
         """
-        创建推荐和团队奖励（按升级层级逐层发放）
+        创建推荐和团队奖励（严格层级版）
 
-        核心业务规则：
-        1. 推荐奖励：用户首次购买（0星→1星）且推荐人是星级会员（≥1星）时发放 1 次
-        2. 团队奖励：只为新达到的等级发放，例如2星→3星只发L3，0星→3星发L2和L3
+        核心修复：
+        1. 团队奖励必须由≥目标层级的用户获得（L2奖励只能由L2+用户获得）
+        2. 如果第N层用户不满足星级，则向上寻找该层的"替代者"
+        3. 防止低层级用户获得高层级奖励（如L1用户拿L2奖励）
 
-        关键修复：
-        - 增加订单级防重复检查
-        - 只为新达到的层级发放奖励（start_layer = max(old_level + 1, 2)）
+        业务规则：
+        - 推荐奖励：仅首次购买（0星→1星）且直接推荐人≥1星时发放
+        - 团队奖励：只为新达到的层级发放，必须由≥目标层级的用户获得
         """
         logger.info(f"开始发放奖励: 订单#{order_id}, 购买者={buyer_id}({old_level}→{new_level}星)")
 
@@ -521,6 +602,8 @@ class FinanceService:
             logger.warning(f"⚠️ 订单#{order_id}的奖励已发放过，跳过重复发放")
             return
         # ===================================================
+
+        total_distributed = Decimal('0')
 
         # 1. 推荐奖励（首次购买 + 推荐人必须是星级会员）
         if old_level == 0:  # 只有0星升1星时才发推荐奖励
@@ -568,6 +651,7 @@ class FinanceService:
                     )
 
                     logger.info(f"推荐奖励发放: 用户{referrer['referrer_id']}({referrer_level}星) +{reward_amount:.2f}")
+                    total_distributed += reward_amount
                 else:
                     logger.debug(f"推荐人{referrer['referrer_id']}不是星级会员({referrer_level}星)，不发放推荐奖励")
             else:
@@ -578,154 +662,145 @@ class FinanceService:
             logger.debug("等级未提升或保持1星，不产生团队奖励")
             return
 
-        # ==================== 关键修复：计算新达到的层级范围 ====================
-        # 例如：2星→3星，只发放L3奖励；0星→3星，发放L2和L3奖励
+        # ==================== 计算新达到的层级范围 ====================
         start_layer = max(old_level + 1, 2)
         logger.debug(f"发放团队奖励层级范围: L{start_layer}-L{new_level}")
         # ========================================================================
 
+        # ==================== 核心修复：构建完整推荐链 ============================
+        current_id = buyer_id
+        referrer_chain = []  # 存储完整的推荐链
+
+        for current_layer in range(1, MAX_TEAM_LAYER + 1):
+            cur.execute(
+                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                (current_id,)
+            )
+            ref = cur.fetchone()
+
+            if not ref or not ref['referrer_id']:
+                logger.debug(f"第{current_layer}层无推荐人，链断裂")
+                break
+
+            referrer_id = ref['referrer_id']
+            cur.execute("SELECT member_level FROM users WHERE id = %s", (referrer_id,))
+            user_row = cur.fetchone()
+            referrer_level = user_row.get('member_level', 0) if user_row else 0
+
+            referrer_chain.append({
+                'layer': current_layer,
+                'user_id': referrer_id,
+                'member_level': referrer_level
+            })
+
+            logger.debug(f"第{current_layer}层: 用户{referrer_id}({referrer_level}星)")
+            current_id = referrer_id
+
+        if not referrer_chain:
+            logger.debug("推荐链为空，无法发放团队奖励")
+            return
+        # ========================================================================
+
+        # ==================== 核心修复：严格层级查找 ===============================
+        # 错误版：if candidate['layer'] > target_layer: continue  # 错误地允许L1用户拿L2奖励
+        # 正确版：if candidate['layer'] < target_layer: continue  # L2奖励只能由L2+用户获得
+
         for target_layer in range(start_layer, new_level + 1):
-            # 第一步：构建完整的推荐链（从第1层到第target_layer层）
-            current_id = buyer_id
-            referrer_chain = []
-
-            logger.debug(f"构建第{target_layer}层推荐链...")
-
-            for current_layer in range(1, target_layer + 1):
-                cur.execute(
-                    "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
-                    (current_id,)
-                )
-                ref = cur.fetchone()
-
-                if not ref or not ref['referrer_id']:
-                    logger.debug(f"第{current_layer}层无推荐人，链断裂")
-                    break
-
-                referrer_id = ref['referrer_id']
-                cur.execute("SELECT member_level FROM users WHERE id = %s", (referrer_id,))
-                user_row = cur.fetchone()
-                referrer_level = user_row['member_level'] if user_row else 0
-
-                referrer_chain.append({
-                    'layer': current_layer,
-                    'user_id': referrer_id,
-                    'member_level': referrer_level
-                })
-
-                logger.debug(f"第{current_layer}层: 用户{referrer_id}({referrer_level}星)")
-                current_id = referrer_id
-
-            # 如果链的长度不足，跳过此层级
-            if len(referrer_chain) < target_layer:
-                logger.debug(f"推荐链仅{len(referrer_chain)}层，不足{target_layer}层，跳过")
-                continue
-
-            # 第二步：从第target_layer层开始向上查找满足条件的推荐人
             reward_recipient = None
 
-            logger.debug(f"查找满足{target_layer}星的推荐人...")
+            # 在完整推荐链中查找满足条件的推荐人（按层级从小到大）
+            for candidate in referrer_chain:
+                # ==================== 关键修复：层级限制 ============================
+                # 错误逻辑：允许低层级用户拿高层级奖励
+                # if candidate['layer'] > target_layer:
+                #     continue
 
-            for i in range(target_layer - 1, -1, -1):
-                candidate = referrer_chain[i]
-                candidate_id = candidate['user_id']
-                candidate_level = candidate['member_level']
-                candidate_layer = candidate['layer']
+                # 正确逻辑：奖励必须由≥目标层级的用户获得
+                if candidate['layer'] < target_layer:
+                    continue  # L2奖励不能由L1用户获得
+                # ====================================================================
 
-                if candidate_level >= target_layer:
+                if candidate['member_level'] >= target_layer:
+                    # 找到第一个满足条件的用户（按层数从小到大）
                     reward_recipient = {
-                        'user_id': candidate_id,
-                        'actual_layer': candidate_layer
+                        'user_id': candidate['user_id'],
+                        'actual_layer': candidate['layer'],
+                        'member_level': candidate['member_level']
                     }
-                    logger.debug(f"找到满足条件的推荐人: 用户{candidate_id}（第{candidate_layer}层，{candidate_level}星）")
-                    break
-                else:
                     logger.debug(
-                        f"用户{candidate_id}（第{candidate_layer}层，{candidate_level}星）不满足{target_layer}星，继续向上")
+                        f"找到满足条件的推荐人: 用户{candidate['user_id']}（第{candidate['layer']}层，{candidate['member_level']}星）")
+                    break
 
-            # 第三步：发放奖励
-            if reward_recipient:
-                recipient_id = reward_recipient['user_id']
-                actual_layer = reward_recipient['actual_layer']
-
-                reward_amount = single_price * Decimal('0.50')
-
-                # 发放到 team_reward_points
-                cur.execute(
-                    "UPDATE users SET team_reward_points = COALESCE(team_reward_points, 0) + %s WHERE id = %s",
-                    (reward_amount, recipient_id)
-                )
-                # 更新 true_total_points
-                cur.execute(
-                    "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
-                    (reward_amount, recipient_id)
-                )
-
-                # 记录流水
-                cur.execute(
-                    "SELECT COALESCE(team_reward_points, 0) AS team_reward_points FROM users WHERE id = %s",
-                    (recipient_id,)
-                )
-                new_balance = Decimal(str(cur.fetchone()['team_reward_points'] or 0))
-
-                cur.execute(
-                    """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
-                       flow_type, remark, created_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                    ('team_reward_points', recipient_id, reward_amount,
-                     new_balance, 'income', f"团队L{target_layer}奖励（来自第{actual_layer}层）- 订单#{order_id}")
-                )
-
-                logger.info(
-                    f"团队奖励发放: 用户{recipient_id}（第{actual_layer}层）获得L{target_layer}奖励 {reward_amount:.2f}")
-            else:
+            if not reward_recipient:
                 logger.debug(f"第{target_layer}层无满足星级{target_layer}的推荐人，跳过")
+                continue
 
-    def _create_order(self, order_no: str, user_id: int, merchant_id: int,
-                      product_id: int, total_amount: Decimal, original_amount: Decimal,
-                      points_discount: Decimal, is_member: bool) -> int:
-        # 关键修改：字段名 order_number
-        result = self.session.execute(
-            """INSERT INTO orders (order_number, user_id, merchant_id, total_amount, original_amount, points_discount, is_member_order, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'completed')""",
-            {
-                "order_number": order_no,
-                "user_id": user_id,
-                "merchant_id": merchant_id,
-                "total_amount": total_amount,
-                "original_amount": original_amount,
-                "points_discount": points_discount,
-                "is_member": is_member
-            }
-        )
-        order_id = result.lastrowid
+            # ==================== 发放奖励 ====================
+            recipient_id = reward_recipient['user_id']
+            actual_layer = reward_recipient['actual_layer']
 
-        self.session.execute(
-            """INSERT INTO order_items (order_id, product_id, quantity, unit_price, total_price)
-                    VALUES (%s, %s, 1, %s, %s)""",
-            {
-                "order_id": order_id,
-                "product_id": product_id,
-                "unit_price": original_amount,
-                "total_price": original_amount
-            }
-        )
-        return order_id
+            reward_amount = single_price * Decimal('0.50')
+
+            # 发放到 team_reward_points
+            cur.execute(
+                "UPDATE users SET team_reward_points = COALESCE(team_reward_points, 0) + %s WHERE id = %s",
+                (reward_amount, recipient_id)
+            )
+            # 更新 true_total_points
+            cur.execute(
+                "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
+                (reward_amount, recipient_id)
+            )
+
+            # 记录流水
+            cur.execute(
+                "SELECT COALESCE(team_reward_points, 0) AS team_reward_points FROM users WHERE id = %s",
+                (recipient_id,)
+            )
+            new_balance = Decimal(str(cur.fetchone()['team_reward_points'] or 0))
+
+            cur.execute(
+                """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                   flow_type, remark, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                ('team_reward_points', recipient_id, reward_amount,
+                 new_balance, 'income', f"团队L{target_layer}奖励（来自第{actual_layer}层）- 订单#{order_id}")
+            )
+
+            total_distributed += reward_amount
+            logger.info(
+                f"团队奖励发放: 用户{recipient_id}（第{actual_layer}层）获得L{target_layer}奖励 {reward_amount:.2f}")
+
+        logger.info(f"奖励发放完成: 订单#{order_id}共发放{total_distributed:.2f}点数")
 
     # ==================== 关键修改3：member_points积分发放 ====================
     def _allocate_funds_to_pools(self, order_id: int, total_amount: Decimal) -> None:
-        platform_revenue = total_amount * Decimal('0.80')
+        try:
+            allocs = self.get_pool_allocations()
+            platform_revenue = total_amount * allocs.get('merchant_balance', Decimal('0.80'))
+        except Exception:
+            allocs = None
+            platform_revenue = total_amount * Decimal('0.80')
+
         # 使用 helper 统一处理平台池子余额变更与流水
         self._add_pool_balance('platform_revenue_pool', platform_revenue, f"订单#{order_id} 平台收入")
 
-        for purpose, percent in ALLOCATIONS.items():
-            if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
-                continue
-            alloc_amount = total_amount * percent
-            # 统一通过 helper 更新各类池子与记录流水
-            self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}")
-            if purpose == AllocationKey.PUBLIC_WELFARE:
-                logger.debug(f"公益基金获得: ¥{alloc_amount}")
+        if allocs:
+            for atype, ratio in allocs.items():
+                if atype == 'merchant_balance':
+                    continue
+                alloc_amount = total_amount * ratio
+                self._add_pool_balance(atype, alloc_amount, f"订单#{order_id} 分配到{atype}")
+                if atype == 'public_welfare':
+                    logger.debug(f"公益基金获得: ¥{alloc_amount}")
+        else:
+            for purpose, percent in ALLOCATIONS.items():
+                if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
+                    continue
+                alloc_amount = total_amount * percent
+                self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}")
+                if purpose == AllocationKey.PUBLIC_WELFARE:
+                    logger.debug(f"公益基金获得: ¥{alloc_amount}")
 
     def audit_and_distribute_rewards(self, reward_ids: List[int], approve: bool, auditor: str = 'admin') -> bool:
         """批量审核奖励并发放优惠券"""
@@ -848,16 +923,125 @@ class FinanceService:
 
                 return result
 
-    # 完整替换 services/finance_service.py 中的 distribute_weekly_subsidy 方法
+    def _get_adjusted_points_value(self) -> Optional[Dict[str, Any]]:
+        """获取手动调整的积分值配置，返回包含 value 和 auto_clear 的字典"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT config_params FROM finance_accounts WHERE account_type = 'subsidy_pool'"
+                    )
+                    row = cur.fetchone()
+
+                    if row and row.get('config_params'):
+                        try:
+                            import json
+                            config = json.loads(row['config_params']) if isinstance(row['config_params'], str) else row[
+                                'config_params']
+
+                            if isinstance(config, dict) and 'points_value' in config:
+                                value = Decimal(str(config['points_value']))
+                                auto_clear = config.get('auto_clear', False)
+                                if 0 <= value <= MAX_POINTS_VALUE:
+                                    return {
+                                        'value': value,
+                                        'auto_clear': auto_clear
+                                    }
+                        except:
+                            pass
+        except Exception as e:
+            logger.error(f"获取积分值配置失败: {e}")
+        return None
+
+    def adjust_subsidy_points_value(self, points_value: Optional[float] = None, auto_clear: bool = False) -> bool:
+        """
+        手动调整周补贴积分值
+
+        Args:
+            points_value: 积分值（0-0.02），传入None表示取消手动调整，恢复自动计算
+            auto_clear: 是否在发放一次后自动清除（默认为False，不自动清除）
+        """
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if points_value is None:
+                        # 取消调整
+                        cur.execute(
+                            "UPDATE finance_accounts SET config_params = NULL WHERE account_type = 'subsidy_pool'"
+                        )
+                        logger.info("已取消周补贴积分值手动调整，恢复自动计算")
+                    else:
+                        # 设置调整值
+                        value = Decimal(str(points_value))
+                        if value < 0 or value > MAX_POINTS_VALUE:
+                            raise FinanceException(f"积分值必须在0到{MAX_POINTS_VALUE}之间")
+
+                        import json
+                        config = json.dumps({"points_value": str(value), "auto_clear": auto_clear})
+                        cur.execute(
+                            "UPDATE finance_accounts SET config_params = %s WHERE account_type = 'subsidy_pool'",
+                            (config,)
+                        )
+
+                        logger.info(f"已设置周补贴积分值手动调整: {value:.4f}，auto_clear={auto_clear}")
+
+                    conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"调整积分值失败: {e}")
+            raise
+
+    def get_current_points_value(self) -> Dict[str, Any]:
+        """查询当前积分值配置"""
+        # 检查是否有手动调整
+        adjusted_config = self._get_adjusted_points_value()
+
+        # 获取补贴池余额和总积分
+        pool_balance = self.get_account_balance('subsidy_pool')
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT SUM(COALESCE(member_points, 0)) as total FROM users")
+                total_member_points = Decimal(str(cur.fetchone()['total'] or 0))
+
+        # 自动计算值
+        auto_value = pool_balance / total_member_points if total_member_points > 0 else Decimal('0')
+        if auto_value > MAX_POINTS_VALUE:
+            auto_value = MAX_POINTS_VALUE
+
+        if adjusted_config:
+            current_value = adjusted_config['value']
+            is_manual_adjusted = True
+            manual_value = float(adjusted_config['value'])
+            auto_clear = adjusted_config.get('auto_clear', False)
+        else:
+            current_value = auto_value
+            is_manual_adjusted = False
+            manual_value = None
+            auto_clear = False
+
+        return {
+            "current_value": float(current_value),
+            "is_manual_adjusted": is_manual_adjusted,
+            "manual_value": manual_value,
+            "auto_clear": auto_clear,
+            "auto_calculated_value": float(auto_value),
+            "subsidy_pool_balance": float(pool_balance),
+            "total_member_points": float(total_member_points),
+            "max_allowed_value": float(MAX_POINTS_VALUE),
+            "remark": "积分值 = 补贴池金额 ÷ 总积分，最高不超过0.02（2%）。如果设置了auto_clear=true，发放一次后会自动清除手动配置。"
+        }
 
     def distribute_weekly_subsidy(self) -> bool:
         """
         发放周补贴（增加 subsidy_points 并扣减 member_points）
 
-        关键修复：在扣减积分时同步写入 points_log 流水记录，
-        确保积分报表能正确显示周补贴导致的积分支出
-
-        新增：将扣除的积分转入公司积分账户池，并记录资金池流水
+        关键修复：
+        1. 在扣减积分时同步写入 points_log 流水记录
+        2. 将扣除的积分转入公司积分账户池，并记录资金池流水
+        3. 【新增】从 subsidy_pool 扣除发放的 subsidy_amount
+        4. 【新增】只扣除与发放点数等量的积分（不再是全部积分）
+        5. 【新增】支持手动积分值，发放后根据 auto_clear 标志自动清除
         """
         logger.info("周补贴发放开始（发放专用点数并扣减积分）")
 
@@ -876,15 +1060,23 @@ class FinanceService:
             logger.warning("❌ 总积分为0，无法发放补贴")
             return False
 
-        # 积分价值 = 补贴池金额 / 总积分，最高0.02
-        points_value = pool_balance / total_member_points
-        if points_value > MAX_POINTS_VALUE:
-            points_value = MAX_POINTS_VALUE
+        # 【关键修改】检查是否有手动调整的积分值
+        adjusted_config = self._get_adjusted_points_value()
+        if adjusted_config:
+            points_value = adjusted_config['value']
+            auto_clear = adjusted_config.get('auto_clear', False)
+            logger.info(f"使用手动调整的积分值: {points_value:.4f}")
+        else:
+            points_value = pool_balance / total_member_points
+            if points_value > MAX_POINTS_VALUE:
+                points_value = MAX_POINTS_VALUE
+            auto_clear = False
+            logger.info(f"积分价值自动计算: ¥{points_value:.4f}/分")
 
         logger.info(f"补贴池: ¥{pool_balance} | 总积分: {total_member_points} | 积分值: ¥{points_value:.4f}/分")
 
         total_distributed = Decimal('0')
-        total_points_deducted = Decimal('0')  # 新增：统计总扣除积分
+        total_points_deducted = Decimal('0')  # 统计总扣除积分
         today = datetime.now().date()
 
         try:
@@ -910,7 +1102,14 @@ class FinanceService:
                         if points_to_add <= Decimal('0'):
                             continue
 
-                        # ====== 核心修复：发放补贴点数 ======
+                        # 【关键修改1】只扣除与发放点数等量的积分（不再是全部积分）
+                        # 如果用户积分不足，则最多扣除到0
+                        points_to_deduct = min(points_to_add, member_points)
+
+                        if points_to_deduct <= Decimal('0'):
+                            continue
+
+                        # ====== 发放补贴点数 ======
                         new_subsidy_points = current_subsidy_points + points_to_add
                         cur.execute(
                             "UPDATE users SET subsidy_points = %s WHERE id = %s",
@@ -920,33 +1119,33 @@ class FinanceService:
                             "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
                             (points_to_add, user_id)
                         )
-                        # ====== 核心修复：扣减 member_points 并记录流水 ======
-                        # 1. 扣减积分
+
+                        # ====== 扣减 member_points（等量扣除） ======
                         cur.execute(
                             "UPDATE users SET member_points = member_points - %s WHERE id = %s",
-                            (member_points, user_id)
+                            (points_to_deduct, user_id)
                         )
 
-                        # 2. 获取扣减后的余额
+                        # 获取扣减后的余额
                         cur.execute(
                             "SELECT member_points FROM users WHERE id = %s",
                             (user_id,)
                         )
                         new_balance = Decimal(str(cur.fetchone()['member_points'] or 0))
 
-                        # 3. 写入积分扣减流水（type='member' 表示会员积分，change_amount为负值）
+                        # 写入积分扣减流水
                         cur.execute(
                             """INSERT INTO points_log 
                                (user_id, change_amount, balance_after, type, reason, related_order, created_at)
                                VALUES (%s, %s, %s, 'member', %s, NULL, NOW())""",
-                            (user_id, -member_points, new_balance, f"周补贴扣减积分")
+                            (user_id, -points_to_deduct, new_balance, f"周补贴扣减积分")
                         )
 
-                        # ====== 新增：将扣除的积分转入公司积分池 ======
+                        # ====== 将扣除的积分转入公司积分池 ======
                         # 1. 增加公司积分池余额
                         cur.execute(
                             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
-                            (member_points,)
+                            (points_to_deduct,)
                         )
 
                         # 2. 获取更新后的公司积分池余额
@@ -961,28 +1160,39 @@ class FinanceService:
                             """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
                                flow_type, remark, created_at)
                                VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                            ('company_points', user_id, member_points, company_balance, 'income',
-                             f"周补贴扣除积分转入 - 用户{user_id}扣除{member_points:.4f}分")
+                            ('company_points', user_id, points_to_deduct, company_balance, 'income',
+                             f"周补贴扣除积分转入 - 用户{user_id}扣除{points_to_deduct:.4f}分")
                         )
 
-                        # 4. 记录发放历史到 weekly_subsidy_records
+                        # 【新增】从 subsidy_pool 扣除发放的 subsidy_amount
+                        # 使用 _add_pool_balance 来统一处理余额更新和流水记录
+                        self._add_pool_balance(cur, 'subsidy_pool', -subsidy_amount,
+                                               f"周补贴发放 - 用户{user_id}获得{points_to_add:.4f}点数",
+                                               related_user=None)
+
+                        # 记录发放历史到 weekly_subsidy_records
                         cur.execute(
                             """INSERT INTO weekly_subsidy_records 
                                (user_id, week_start, subsidy_amount, points_before, points_deducted)
                                VALUES (%s, %s, %s, %s, %s)""",
-                            (user_id, today, subsidy_amount, member_points, points_to_add)
+                            (user_id, today, subsidy_amount, member_points, points_to_deduct)
                         )
 
                         total_distributed += subsidy_amount
-                        total_points_deducted += member_points  # 累加总扣除积分
+                        total_points_deducted += points_to_deduct
                         logger.info(
                             f"用户{user_id}: 发放补贴点数{points_to_add:.4f}, "
-                            f"扣减积分{member_points:.4f}, 余额{new_balance:.4f}, "
-                            f"转入公司积分池{member_points:.4f}"
+                            f"扣减积分{points_to_deduct:.4f}, 余额{new_balance:.4f}, "
+                            f"转入公司积分池{points_to_deduct:.4f}"
                         )
 
                     # 提交事务
                     conn.commit()
+
+            # 【新增】如果设置了 auto_clear=true，发放完成后自动清除手动配置
+            if auto_clear:
+                logger.info("发放完成，自动清除手动积分值配置")
+                self.adjust_subsidy_points_value(None)  # 清除配置
 
             logger.info(f"周补贴完成: 发放¥{total_distributed:.4f}等值点数，"
                         f"扣除积分{total_points_deducted:.4f}分，涉及{len(users)}个用户")
@@ -1253,7 +1463,24 @@ class FinanceService:
                              change_amount: Decimal, flow_type: str,
                              remark: str, account_id: Optional[int] = None) -> None:
         """插入流水记录（必须使用同一个cur）"""
-        balance_after = self._get_balance_after(cur, account_type, related_user)  # 传cur
+        # 修复：移除多余的 cur 参数，直接从 cur 查询余额
+        if related_user and account_type in ['promotion_balance', 'merchant_balance']:
+            # 查询用户余额字段
+            select_sql = build_dynamic_select(
+                cur,
+                "users",
+                where_clause="id=%s",
+                select_fields=[account_type]
+            )
+            cur.execute(select_sql, (related_user,))
+            row = cur.fetchone()
+            balance_after = Decimal(str(row.get(account_type, 0) or 0)) if row else Decimal('0')
+        else:
+            # 查询平台资金池余额
+            cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+            row = cur.fetchone()
+            balance_after = Decimal(str(row['balance'] if row and row['balance'] is not None else 0))
+
         cur.execute(
             """INSERT INTO account_flow (account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""",
@@ -1346,6 +1573,164 @@ class FinanceService:
         return result
         # ========== 临时日志结束 ==========
         # return self.get_account_balance('public_welfare')
+
+    # ==================== 可配置资金池分配（新增） ====================
+    def get_pool_allocations(self) -> Dict[str, Decimal]:
+        """
+        获取当前资金池分配配置。
+
+        返回字典：
+        - merchant_balance: Decimal (如 0.80)
+        - 子池键: Decimal（占比，相对于总订单金额，如 0.01 表示 1%）
+        如果数据库中没有配置，返回默认值（与项目原始占比一致）。
+        """
+        # 我们按行读取 finance_accounts 中每个子池的 config_params.allocation
+        account_keys = [
+            'merchant_balance', 'public_welfare', 'maintain_pool', 'subsidy_pool',
+            'director_pool', 'shop_pool', 'city_pool', 'branch_pool', 'fund_pool'
+        ]
+        cfg_map: Dict[str, Any] = {}
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 确保表有 config_params 列；如果没有则尝试添加（容错）
+                try:
+                    cur.execute("SHOW COLUMNS FROM finance_accounts LIKE 'config_params'")
+                    if not cur.fetchone():
+                        try:
+                            cur.execute("ALTER TABLE finance_accounts ADD COLUMN config_params JSON DEFAULT NULL")
+                            conn.commit()
+                        except Exception as e:
+                            logger.debug(f"无法添加 config_params 列: {e}")
+
+                except Exception:
+                    logger.debug("检查 finance_accounts.config_params 列时出错，继续尝试读取行")
+
+                # 查询表中与我们关心的 account_type 列表匹配的行
+                placeholders = ','.join(['%s'] * len(account_keys))
+                try:
+                    cur.execute(f"SELECT account_type, config_params FROM finance_accounts WHERE account_type IN ({placeholders})", tuple(account_keys))
+                    rows = cur.fetchall()
+                except Exception as e:
+                    logger.error(f"读取 finance_accounts 行失败: {e}")
+                    rows = []
+
+                for r in rows:
+                    at = r.get('account_type')
+                    cp = r.get('config_params')
+                    if not cp:
+                        continue
+                    try:
+                        if isinstance(cp, str):
+                            parsed = json.loads(cp)
+                        else:
+                            parsed = cp
+                        # 支持两种存储形态：{"allocation":"0.01"} 或 直接为字符串数值
+                        if isinstance(parsed, dict) and 'allocation' in parsed:
+                            cfg_map[at] = Decimal(str(parsed['allocation']))
+                        else:
+                            # 可能以前误存为单行 allocations_config map
+                            # parsed 可能是 {'city_pool':'0.01',...}
+                            if isinstance(parsed, dict) and at in parsed:
+                                cfg_map[at] = Decimal(str(parsed[at]))
+                    except Exception:
+                        logger.debug(f"解析 finance_accounts.account_type={at} config_params 失败，忽略")
+
+        # 默认配置（数值为相对于总额的占比）
+        defaults = {
+            'merchant_balance': Decimal('0.80'),
+            'public_welfare': Decimal('0.01'),
+            'maintain_pool': Decimal('0.01'),
+            'subsidy_pool': Decimal('0.12'),
+            'director_pool': Decimal('0.02'),
+            'shop_pool': Decimal('0.01'),
+            'city_pool': Decimal('0.01'),
+            'branch_pool': Decimal('0.005'),
+            'fund_pool': Decimal('0.015')
+        }
+
+        # 用读取到的行优先覆盖默认值
+        result: Dict[str, Decimal] = defaults.copy()
+        for k in defaults.keys():
+            if k in cfg_map:
+                result[k] = cfg_map[k]
+
+        return result
+
+    def _validate_allocations(self, allocs: Dict[str, Any]) -> Dict[str, Decimal]:
+        """校验并规范化传入的 allocations 字典，返回 Decimal 值字典。"""
+        allowed_subpools = {
+            'public_welfare', 'maintain_pool', 'subsidy_pool', 'director_pool',
+            'shop_pool', 'city_pool', 'branch_pool', 'fund_pool'
+        }
+        # merchant_balance 可选，但我们不允许设置超过 1
+        out: Dict[str, Decimal] = {}
+        for k, v in allocs.items():
+            if k not in allowed_subpools and k != 'merchant_balance':
+                raise ValueError(f"未知的资金池键: {k}")
+            try:
+                dec = Decimal(str(v))
+            except Exception:
+                raise ValueError(f"资金池比例必须是数值: {k}")
+            if dec < 0 or dec > 1:
+                raise ValueError(f"资金池比例范围必须在 0..1 之间: {k}")
+            out[k] = dec
+
+        # 校验总和：所有子池之和（不包括 merchant_balance）不得超过 0.20
+        sub_sum = sum((out.get(k, Decimal('0')) for k in allowed_subpools), Decimal('0'))
+        if sub_sum > Decimal('0.20'):
+            raise ValueError("所有子资金池的占比之和不得超过20%（0.20）")
+
+        # 若提供 merchant_balance，则确保 merchant_balance + sub_sum <=1
+        if 'merchant_balance' in out:
+            if out['merchant_balance'] + sub_sum > Decimal('1'):
+                raise ValueError("merchant_balance 与子池之和不得超过 100%")
+
+        return out
+
+    def set_pool_allocations(self, allocations: Dict[str, Any]) -> Dict[str, Decimal]:
+        """
+        设置/更新资金池分配配置，按 `account_type` 将 allocation 写入对应的 `finance_accounts.config_params` 字段。
+
+        校验规则：所有子资金池（非 merchant_balance）的占比和不得超过 0.20（即 20%）。
+        返回保存后的配置（Decimal 值）。
+        """
+        normalized = self._validate_allocations(allocations)
+
+        # 将每个 allocation 写入对应的 finance_accounts 行的 config_params 字段
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for atype, dec in normalized.items():
+                    try:
+                        cur.execute("SELECT id, config_params FROM finance_accounts WHERE account_type=%s LIMIT 1", (atype,))
+                        row = cur.fetchone()
+                        new_cp = None
+                        if row:
+                            cp = row.get('config_params')
+                            try:
+                                if isinstance(cp, str):
+                                    parsed = json.loads(cp)
+                                else:
+                                    parsed = cp or {}
+                            except Exception:
+                                parsed = {}
+                            if not isinstance(parsed, dict):
+                                parsed = {}
+                            parsed['allocation'] = str(dec)
+                            new_cp = json.dumps(parsed, ensure_ascii=False)
+                            cur.execute("UPDATE finance_accounts SET config_params=%s WHERE id=%s", (new_cp, row['id']))
+                        else:
+                            # account_type 不存在则插入新行
+                            parsed = {'allocation': str(dec)}
+                            cur.execute(
+                                "INSERT INTO finance_accounts(account_name, account_type, balance, config_params) VALUES (%s,%s,%s,%s)",
+                                (atype, atype, 0, json.dumps(parsed, ensure_ascii=False))
+                            )
+                    except Exception as e:
+                        logger.error(f"更新 finance_accounts.account_type={atype} 的 config_params 失败: {e}")
+                conn.commit()
+
+        # 返回最新的合并配置（读取每行）
+        return self.get_pool_allocations()
 
     def get_public_welfare_flow(self, limit: int = 50) -> List[Dict[str, Any]]:
         with get_conn() as conn:
@@ -1782,11 +2167,13 @@ class FinanceService:
         计算联创星级分红预览（展示每个权重的金额）
 
         返回：
-        - 资金池余额
+        - 资金池余额（扣除后的预估余额）
         - 总权重（所有联创星级之和）
         - 每个权重的自动计算金额
         - 是否设置了手动调整
         - 所有联创用户列表
+        - 【新增】estimated_balance_after: 扣除后的预估余额
+        - 【新增】total_required: 总发放金额
         """
         logger.info("计算联创星级分红预览")
 
@@ -1796,13 +2183,31 @@ class FinanceService:
         # 2. 查询所有联创用户
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # === 关键修复：使用 JOIN + BETWEEN 替代 EXISTS ===
+                cur.execute("SET time_zone = '+08:00'")
+
+                # 1. 查询分红池余额
+                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'honor_director'")
+                row = cur.fetchone()
+                pool_balance = Decimal(str(row['balance'] if row and row['balance'] is not None else 0))
+
+                # 2. ✅ 修正查询：使用 INNER JOIN + GROUP BY
                 cur.execute("""
                     SELECT uu.user_id, uu.level, u.name, u.member_level
                     FROM user_unilevel uu
                     JOIN users u ON uu.user_id = u.id
+                    INNER JOIN (
+                        SELECT DISTINCT o.user_id
+                        FROM orders o
+                        WHERE o.status IN ('pending_ship','pending_recv','completed')
+                          AND o.created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+                          AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+                    ) AS active_users ON uu.user_id = active_users.user_id
                     WHERE uu.level IN (1, 2, 3)
                 """)
                 unilevel_users = cur.fetchall()
+
+                logger.error(f"=== DEBUG: 联创用户数={len(unilevel_users)}，数据={unilevel_users}")
 
         if not unilevel_users:
             return {
@@ -1813,6 +2218,8 @@ class FinanceService:
                 "adjustment_configured": False,
                 "adjusted_amount": None,
                 "will_use_adjusted": False,
+                "estimated_balance_after": float(pool_balance),  # 无发放，余额不变
+                "total_required": 0.0,
                 "users": []
             }
 
@@ -1825,6 +2232,16 @@ class FinanceService:
         # 5. 检查是否有手动调整配置
         adjusted_amount = self._get_adjusted_unilevel_amount()
 
+        # 6. 预估扣除后的余额和总发放金额
+        if adjusted_amount is not None:
+            amount_per_weight = adjusted_amount
+            total_required = amount_per_weight * total_weight
+            estimated_balance_after = pool_balance - total_required
+        else:
+            amount_per_weight = amount_per_weight_auto
+            total_required = amount_per_weight * total_weight
+            estimated_balance_after = pool_balance - total_required
+
         return {
             "pool_balance": float(pool_balance),
             "total_weight": int(total_weight),
@@ -1833,6 +2250,8 @@ class FinanceService:
             "adjustment_configured": adjusted_amount is not None,
             "adjusted_amount": float(adjusted_amount) if adjusted_amount else None,
             "will_use_adjusted": adjusted_amount is not None,
+            "estimated_balance_after": float(estimated_balance_after),  # 新增
+            "total_required": float(total_required),  # 新增
             "users": [
                 {
                     "user_id": user['user_id'],
@@ -1894,17 +2313,28 @@ class FinanceService:
         2. 优先使用手动调整的金额
         3. 计算所需总额并检查余额
         4. 执行分红发放
-        5. 成功后清除手动调整配置
+        5. 【新增】从 honor_director 池扣除发放的 points_to_add
+        6. 成功后清除手动调整配置
         """
         logger.info("联创星级分红发放开始（检测手动调整配置）")
 
         # 查询所有联创用户
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # === 使用相同的 JOIN 查询 ===
+                cur.execute("SET time_zone = '+08:00'")
+
                 cur.execute("""
                     SELECT uu.user_id, uu.level, u.name, u.member_level
                     FROM user_unilevel uu
                     JOIN users u ON uu.user_id = u.id
+                    INNER JOIN (
+                        SELECT DISTINCT o.user_id
+                        FROM orders o
+                        WHERE o.status IN ('pending_ship','pending_recv','completed')
+                          AND o.created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+                          AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+                    ) AS active_users ON uu.user_id = active_users.user_id
                     WHERE uu.level IN (1, 2, 3)
                 """)
                 unilevel_users = cur.fetchall()
@@ -1972,6 +2402,12 @@ class FinanceService:
                             VALUES (%s, %s, %s, %s, %s, %s, NOW())
                         """, ('honor_director', user_id, points_to_add, 0, 'income',
                               f"联创{weight}星级分红（权重{weight}/{total_weight}）"))
+
+                        # 【新增】从 honor_director 池扣除发放的 points_to_add
+                        # 使用 _add_pool_balance 来统一处理余额更新和流水记录
+                        self._add_pool_balance(cur, 'honor_director', -points_to_add,
+                                               f"联创星级分红发放 - 用户{user_id}获得{points_to_add:.4f}点数",
+                                               related_user=None)
 
                         total_distributed += points_to_add
                         logger.debug(f"用户{user_id}获得联创星级分红: {points_to_add:.4f}点数")
@@ -2653,87 +3089,115 @@ class FinanceService:
     def get_pool_flow_report(self, account_type: str,
                              start_date: str, end_date: str,
                              page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """
-        平台资金池变动明细报表
-
-        查询指定资金池的每一笔流水，包括收入、支出和余额变化
-
-        Args:
-            account_type: 资金池类型（如 'public_welfare', 'subsidy_pool' 等）
-            start_date: 开始日期 yyyy-MM-dd
-            end_date: 结束日期 yyyy-MM-dd
-            page: 页码
-            page_size: 每页条数
-
-        Returns:
-            包含汇总统计和流水明细的报表数据
-        """
         logger.info(f"生成资金池流水报表: 账户={account_type}, 日期范围={start_date}至{end_date}")
 
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # ==================== 查询平台余额（保持不变） ====================
+                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+                account_row = cur.fetchone()
+                actual_current_balance = Decimal(str(account_row['balance'] if account_row else 0))
+
+                # ==================== ✅ 智能过滤：只对 honor_director 强制过滤 ====================
+                where_conditions = [
+                    "account_type = %s",
+                    "DATE(created_at) BETWEEN %s AND %s"
+                ]
+                params = [account_type, start_date, end_date]
+
+                # 关键判断：只有联创分红池才过滤 related_user=NULL
+                # 其他池子（如 referral_points, team_reward_points）保留用户记录
+                if account_type == 'honor_director':
+                    where_conditions.append("related_user IS NULL")
+
+                # ==================== 后续查询逻辑（保持不变） ====================
+                where_sql = " AND ".join(where_conditions)
+
                 # 汇总统计
-                cur.execute("""
+                cur.execute(f"""
                     SELECT 
                         COUNT(*) as total_transactions,
                         SUM(CASE WHEN flow_type = 'income' THEN change_amount ELSE 0 END) as total_income,
-                        SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense,
-                        MAX(balance_after) as ending_balance
+                        SUM(CASE WHEN flow_type = 'expense' THEN change_amount ELSE 0 END) as total_expense
                     FROM account_flow
-                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
-                """, (account_type, start_date, end_date))
-
+                    WHERE {where_sql}
+                """, tuple(params))
                 summary = cur.fetchone()
 
                 # 总记录数
-                cur.execute("""
+                cur.execute(f"""
                     SELECT COUNT(*) as total 
                     FROM account_flow
-                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
-                """, (account_type, start_date, end_date))
+                    WHERE {where_sql}
+                """, tuple(params))
                 total_count = cur.fetchone()['total'] or 0
 
-                # 明细查询
+                # 明细查询（保持不变）
                 offset = (page - 1) * page_size
-                cur.execute("""
+                cur.execute(f"""
                     SELECT 
                         id, related_user, change_amount, balance_after, 
                         flow_type, remark, created_at
                     FROM account_flow
-                    WHERE account_type = %s AND DATE(created_at) BETWEEN %s AND %s
-                    ORDER BY created_at DESC
+                    WHERE {where_sql}
+                    ORDER BY created_at DESC, id DESC
                     LIMIT %s OFFSET %s
-                """, (account_type, start_date, end_date, page_size, offset))
-
+                """, tuple(params + [page_size, offset]))
                 records = cur.fetchall()
 
-                # 获取用户名称
+                # ==================== ✅ 获取用户名称（优化） ====================
                 def get_user_name(uid):
                     if not uid:
                         return "系统"
+                    if uid == 0:  # 平台商户ID
+                        return "平台"
                     try:
                         cur.execute("SELECT name FROM users WHERE id = %s", (uid,))
                         row = cur.fetchone()
-                        return row['name'] if row else "未知用户"
-                    except:
-                        return f"未知用户:{uid}"
+                        return row['name'] if row else f"未知用户:{uid}"
+                    except Exception:
+                        return f"查询失败:{uid}"
+
+                # ====================================================================
+
+                # ==================== ✅ 计算净变动 ====================
+                # 净变动 = 总收入 - 总支出（与流水表逻辑一致）
+                total_income = Decimal(str(summary['total_income'] or 0))
+                total_expense = Decimal(str(summary['total_expense'] or 0))
+                net_change = total_income - total_expense
+
+                # 验证数据一致性（可选，调试用）
+                # 当前余额 ≈ 期初余额 + 净变动（如果查询了期初余额）
+                # ====================================================================
+
+                # 账户类型中文名称映射
+                account_name_map = {
+                    "public_welfare": "公益基金",
+                    "subsidy_pool": "周补贴池",
+                    "honor_director": "荣誉董事分红池",
+                    "company_points": "公司积分池",
+                    "platform_revenue_pool": "平台收入池",
+                    "maintain_pool": "平台维护池",
+                    "director_pool": "荣誉董事池",
+                    "shop_pool": "社区店池",
+                    "city_pool": "城市运营中心池",
+                    "branch_pool": "大区分公司池",
+                    "fund_pool": "事业发展基金池",
+                    "merchant_balance": "商户余额池"
+                }
 
                 return {
                     "summary": {
                         "report_type": "pool_flow",
                         "account_type": account_type,
-                        "account_name": {
-                            "public_welfare": "公益基金",
-                            "subsidy_pool": "周补贴池",
-                            "honor_director": "荣誉董事分红池",
-                            "company_points": "公司积分池",
-                            "platform_revenue_pool": "平台收入池"
-                        }.get(account_type, account_type),
+                        "account_name": account_name_map.get(account_type, account_type),
                         "total_transactions": summary['total_transactions'] or 0,
-                        "total_income": float(summary['total_income'] or 0),
-                        "total_expense": float(summary['total_expense'] or 0),
-                        "net_change": float((summary['total_income'] or 0) - (summary['total_expense'] or 0)),
-                        "ending_balance": float(summary['ending_balance'] or 0)
+                        "total_income": float(total_income),
+                        "total_expense": float(total_expense),
+                        "net_change": float(net_change),
+                        # ✅ 修复：使用真实的当前余额
+                        "ending_balance": float(actual_current_balance),
+                        "query_date_range": f"{start_date} 至 {end_date}"
                     },
                     "pagination": {
                         "page": page,
@@ -2747,12 +3211,14 @@ class FinanceService:
                             "related_user": r['related_user'],
                             "user_name": get_user_name(r['related_user']),
                             "change_amount": float(r['change_amount']),
-                            "balance_after": float(r['balance_after']) if r['balance_after'] else None,
+                            "balance_after": float(r['balance_after']) if r['balance_after'] is not None else None,
                             "flow_type": r['flow_type'],
                             "remark": r['remark'],
                             "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
                         } for r in records
-                    ]
+                    ],
+                    "data_source": "finance_accounts + account_flow",  # 数据来源说明
+                    "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
     # ==================== 联创星级点数流水报表 ====================
     def get_unilevel_points_flow_report(self, user_id: Optional[int] = None,
@@ -3597,20 +4063,7 @@ class FinanceService:
                 }
 
     def get_weekly_subsidy_preview(self, year: int, week: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """周补贴预览报表（全用户）
-
-        查询所有用户在指定周的积分余额和预计可获得的周补贴优惠券金额
-        支持分页返回
-
-        Args:
-            year: 年份，如2025
-            week: 周数，1-53
-            page: 页码
-            page_size: 每页条数
-
-        Returns:
-            包含汇总统计、分页信息和用户明细列表的字典
-        """
+        """周补贴预览报表（全用户）"""
         logger.info(f"生成全用户周补贴预览报表: {year}年第{week}周，页码={page}")
 
         from datetime import date, timedelta
@@ -3658,13 +4111,20 @@ class FinanceService:
 
                 total_points = total_user_points + total_merchant_points + company_points
 
-                # 3. 计算积分价值
-                if total_points <= 0:
-                    points_value = Decimal('0')
+                # 3. 计算积分价值（先检查手动调整）
+                adjusted_points_value = self._get_adjusted_points_value()
+
+                if adjusted_points_value is not None:
+                    # 使用手动调整的积分值
+                    points_value = adjusted_points_value
+                    is_manual_adjusted = True
+                    logger.info(f"预览使用手动调整的积分值: {points_value:.4f}")
                 else:
-                    points_value = pool_balance / total_points
+                    # 按原方案自动计算
+                    points_value = pool_balance / total_points if total_points > 0 else Decimal('0')
                     if points_value > MAX_POINTS_VALUE:
                         points_value = MAX_POINTS_VALUE
+                    is_manual_adjusted = False
 
                 # 4. 查询所有有积分的用户（分页）
                 offset = (page - 1) * page_size
@@ -3694,7 +4154,7 @@ class FinanceService:
                         "user_id": user['id'],
                         "user_name": user['name'],
                         "member_points": float(user_points),
-                        "estimated_coupon_amount": float(estimated_coupon),
+                        "estimated_points_amount": float(estimated_coupon),
                         "points_percentage": float(user_points / total_points * 100) if total_points > 0 else 0.0
                     })
 
@@ -3710,7 +4170,8 @@ class FinanceService:
                         "subsidy_pool_balance": float(pool_balance),
                         "total_system_points": float(total_points),
                         "points_value_per_point": float(points_value),
-                        "max_points_value_applied": points_value >= MAX_POINTS_VALUE
+                        "max_points_value_applied": points_value >= MAX_POINTS_VALUE,
+                        "is_manual_adjusted": is_manual_adjusted  # 新增：是否手动调整
                     },
                     "pagination": {
                         "page": page,
@@ -3727,7 +4188,6 @@ class FinanceService:
                     "remark": "按member_points降序排列，支持分页查询"
                 }
 
-    # 替换 services/finance_service.py 中的 get_order_points_flow_report 方法
 
     def get_order_points_flow_report(self, start_date: str, end_date: str,
                                      user_id: Optional[int] = None,
@@ -4669,8 +5129,25 @@ def _execute_split(cur, order_number: str, total: Decimal):
         order_number: 订单号
         total: 订单总金额
     """
-    # 商家分得 80%
-    merchant = total * Decimal("0.8")
+    # 动态读取配置（优先从 finance_accounts 行中读取 allocation）
+    try:
+        svc = FinanceService()
+        allocs = svc.get_pool_allocations()
+        merchant = total * allocs.get('merchant_balance', Decimal('0.8'))
+    except Exception:
+        merchant = total * Decimal("0.8")
+
+    # 单元级日志：记录订单与初始分配信息
+    try:
+        logger.debug(f"_execute_split START order={order_number} total={total:.2f} merchant={merchant:.2f}")
+        if 'allocs' in locals():
+            try:
+                ratios_str = {k: str(v) for k, v in allocs.items()}
+                logger.debug(f"_execute_split ratios: {ratios_str}")
+            except Exception:
+                logger.debug("_execute_split: 无法序列化 allocs 比例")
+    except Exception:
+        pass
 
     # 更新商家余额（使用 users 表）
     cur.execute(
@@ -4696,64 +5173,65 @@ def _execute_split(cur, order_number: str, total: Decimal):
         ("merchant_balance", merchant, merchant_balance_after, "income", f"订单分账: {order_number}")
     )
 
-    # 平台分得 20%，再分配到各个资金池
-    pool_total = total * Decimal("0.2")
-    # 池子类型到账户类型的映射
-    pool_mapping = {
-        "public": "public_welfare",  # 公益基金
-        "maintain": "maintain_pool",  # 平台维护
-        "subsidy": "subsidy_pool",  # 周补贴池
-        "director": "director_pool",  # 荣誉董事分红
-        "shop": "shop_pool",  # 社区店
-        "city": "city_pool",  # 城市运营中心
-        "branch": "branch_pool",  # 大区分公司
-        "fund": "fund_pool"  # 事业发展基金
-    }
-    pools = {
-        "public": 0.01,  # 公益基金
-        "maintain": 0.01,  # 平台维护
-        "subsidy": 0.12,  # 周补贴池
-        "director": 0.02,  # 荣誉董事分红
-        "shop": 0.01,  # 社区店
-        "city": 0.01,  # 城市运营中心
-        "branch": 0.005,  # 大区分公司
-        "fund": 0.015  # 事业发展基金
-    }
+    # 按每个子池的配置分配（allocs 中的键是 account_type）
+    try:
+        # pools_to_assign: keys except merchant_balance
+        pools_to_assign = {k: v for k, v in allocs.items() if k != 'merchant_balance'}
+    except Exception:
+        pools_to_assign = {
+            'public_welfare': Decimal('0.01'),
+            'maintain_pool': Decimal('0.01'),
+            'subsidy_pool': Decimal('0.12'),
+            'director_pool': Decimal('0.02'),
+            'shop_pool': Decimal('0.01'),
+            'city_pool': Decimal('0.01'),
+            'branch_pool': Decimal('0.005'),
+            'fund_pool': Decimal('0.015')
+        }
 
-    for pool_key, pool_ratio in pools.items():
-        amt = pool_total * Decimal(str(pool_ratio))
-        account_type = pool_mapping[pool_key]
+    for account_type, ratio in pools_to_assign.items():
+        try:
+            amt = total * ratio
+            # 单元级日志：准备分配到指定资金池的金额与比例
+            logger.debug(f"_execute_split allocating to {account_type}: ratio={ratio} amt={amt:.2f}")
 
-        # 确保 finance_accounts 中存在该账户类型
-        cur.execute(
-            "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0) ON DUPLICATE KEY "
-            "UPDATE account_name=VALUES(account_name)",
-            (pool_key, account_type)
-        )
+            # 确保 finance_accounts 中存在该账户类型
+            cur.execute(
+                "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0) ON DUPLICATE KEY "
+                "UPDATE account_name=VALUES(account_name)",
+                (account_type, account_type)
+            )
 
-        # 更新资金池余额
-        cur.execute(
-            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
-            (amt, account_type)
-        )
+            # 更新资金池余额
+            cur.execute(
+                "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
+                (amt, account_type)
+            )
 
-        # 获取更新后的余额
-        select_sql = build_dynamic_select(
-            cur,
-            "finance_accounts",
-            where_clause="account_type = %s",
-            select_fields=["balance"]
-        )
-        cur.execute(select_sql, (account_type,))
-        balance_row = cur.fetchone()
-        balance_after = balance_row["balance"] if balance_row else amt
+            # 获取更新后的余额
+            select_sql = build_dynamic_select(
+                cur,
+                "finance_accounts",
+                where_clause="account_type = %s",
+                select_fields=["balance"]
+            )
+            cur.execute(select_sql, (account_type,))
+            balance_row = cur.fetchone()
+            balance_after = balance_row["balance"] if balance_row else amt
 
-        # 记录流水到 account_flow
-        cur.execute(
-            """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
-               VALUES (%s, %s, %s, %s, %s, NOW())""",
-            (account_type, amt, balance_after, "income", f"订单分账: {order_number}")
-        )
+            # 记录流水到 account_flow
+            cur.execute(
+                """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
+                   VALUES (%s, %s, %s, %s, %s, NOW())""",
+                (account_type, amt, balance_after, "income", f"订单分账: {order_number}")
+            )
+            # 单元级日志：记录分配后余额
+            try:
+                logger.debug(f"_execute_split {account_type} balance_after={Decimal(str(balance_after)):.2f}")
+            except Exception:
+                logger.debug(f"_execute_split {account_type} balance_after (unserializable): {balance_after}")
+        except Exception as e:
+            logger.error(f"分配到池子 {account_type} 时出错: {e}")
 
 
 def reverse_split_on_refund(order_number: str):
@@ -5004,3 +5482,4 @@ def generate_statement():
                 (1, yesterday, opening, income, withdraw_amount, closing)
             )
             conn.commit()
+

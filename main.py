@@ -6,6 +6,7 @@ from pathlib import Path
 import uvicorn
 import pymysql
 from fastapi import FastAPI
+from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html, get_redoc_html
 from core.json_response import DecimalJSONResponse, register_exception_handlers
 from fastapi.staticfiles import StaticFiles
 from core.middleware import setup_cors, setup_static_files
@@ -54,7 +55,7 @@ app = FastAPI(
     title="综合管理系统API",
     description="财务管理系统 + 用户中心 + 订单系统 + 商品管理",
     version="1.0.0",
-    docs_url="/docs",  # Swagger UI 文档地址
+    docs_url="/docs",  # 自定义 docs 路由以支持搜索过滤
     redoc_url="/redoc",  # ReDoc 文档地址
     openapi_url="/openapi.json",  # OpenAPI Schema 地址
     default_response_class=DecimalJSONResponse
@@ -141,6 +142,28 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi
+
+
+# 自定义 Swagger UI 页面，启用 filter 参数以支持输入字母快速搜索 API
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - Swagger UI",
+        swagger_ui_parameters={"filter": True}
+    )
+
+
+# Swagger UI oauth2 redirect 支持
+@app.get(app.swagger_ui_oauth2_redirect_url, include_in_schema=False)
+async def swagger_ui_redirect():
+    return get_swagger_ui_oauth2_redirect_html()
+
+
+# ReDoc 页面（全文搜索），保留在 /redoc
+@app.get("/redoc", include_in_schema=False)
+async def redoc_html():
+    return get_redoc_html(openapi_url=app.openapi_url, title=f"{app.title} - ReDoc")
 
 
 if __name__ == "__main__":
