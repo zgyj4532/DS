@@ -3,12 +3,13 @@
 ## 启动前准备
 
 请先创建并配置 `.env` 文件在根目录中，示例如下：
-
+```
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306
 MYSQL_USER=root
 MYSQL_PASSWORD=password
 MYSQL_DATABASE=sql_db
+```
 ---
 
 ## 运行 / 启动说明
