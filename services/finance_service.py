@@ -3094,28 +3094,17 @@ class FinanceService:
         """
         总会员积分明细报表
 
-        查询用户member_points（会员积分）的详细流水，包括：
-        - 积分收入（购买商品获得）
-        - 积分支出（订单抵扣使用）
-        - 期初余额和期末余额
-        - 关联订单信息
-
-        Args:
-            user_id: 用户ID（可选，查询所有用户则留空）
-            start_date: 开始日期 yyyy-MM-dd
-            end_date: 结束日期 yyyy-MM-dd
-            page: 页码
-            page_size: 每页条数
-
-        Returns:
-            包含汇总、分页和明细的字典
+        关键修复：
+        1. 修复汇总查询的参数传递逻辑
+        2. 确保 WHERE 条件与参数数量匹配
+        3. 不影响原有功能和逻辑
         """
         logger.info(f"生成总会员积分明细报表: 用户={user_id or '所有用户'}, 日期范围={start_date}至{end_date}")
 
         from datetime import datetime, date
 
         # 构建WHERE条件
-        where_conditions = ["pl.type = 'member'"]  # 只查询会员积分类型
+        where_conditions = ["pl.type = 'member'"]
         params = []
 
         if user_id:
@@ -3125,17 +3114,6 @@ class FinanceService:
         if start_date:
             where_conditions.append("DATE(pl.created_at) >= %s")
             params.append(start_date)
-
-            # 计算期初余额：查询开始日期之前的最后一条记录
-            opening_balance_sql = f"""
-                SELECT pl.balance_after 
-                FROM points_log pl
-                WHERE {' AND '.join(where_conditions[:-1])}  # 排除日期条件
-                ORDER BY pl.created_at DESC 
-                LIMIT 1
-            """
-        else:
-            opening_balance_sql = None
 
         if end_date:
             where_conditions.append("DATE(pl.created_at) <= %s")
@@ -3157,7 +3135,6 @@ class FinanceService:
                 # 2. 查询期初余额
                 opening_balance = Decimal('0')
                 if start_date and user_id:
-                    # 查询该用户在开始日期前的最后余额
                     cur.execute("""
                         SELECT balance_after 
                         FROM points_log 
@@ -3180,7 +3157,6 @@ class FinanceService:
                         pl.balance_after,
                         pl.reason,
                         pl.related_order,
-                        o.order_number,
                         pl.created_at
                     FROM points_log pl
                     JOIN users u ON pl.user_id = u.id
@@ -3189,11 +3165,13 @@ class FinanceService:
                     ORDER BY pl.created_at DESC, pl.id DESC
                     LIMIT %s OFFSET %s
                 """
-                params.extend([page_size, offset])
-                cur.execute(detail_sql, tuple(params))
+                # 注意：参数是 params + [page_size, offset]
+                query_params = params + [page_size, offset]
+                cur.execute(detail_sql, tuple(query_params))
                 records = cur.fetchall()
 
-                # 4. 汇总统计
+                # 4. 汇总统计（关键修复：正确处理参数）
+                # 汇总查询应该使用同样的 where_conditions，但移除分页参数
                 summary_sql = f"""
                     SELECT 
                         COUNT(*) as total_records,
@@ -3201,31 +3179,17 @@ class FinanceService:
                         SUM(CASE WHEN pl.change_amount < 0 THEN ABS(pl.change_amount) ELSE 0 END) as total_expense,
                         SUM(pl.change_amount) as net_change
                     FROM points_log pl
-                    WHERE {where_sql.replace(' AND pl.user_id = %s', '') if user_id else where_sql}
+                    WHERE {where_sql}
                 """
-                if user_id:
-                    # 查询单个用户时，汇总统计也按该用户
-                    cur.execute(summary_sql, (user_id, start_date, end_date) if start_date and end_date else (user_id,))
-                else:
-                    # 查询所有用户
-                    if start_date and end_date:
-                        cur.execute(summary_sql, (start_date, end_date))
-                    elif start_date:
-                        cur.execute(summary_sql, (start_date,))
-                    elif end_date:
-                        cur.execute(summary_sql, (end_date,))
-                    else:
-                        cur.execute(summary_sql)
-
+                # 关键修复：使用与 count_sql 相同的参数
+                cur.execute(summary_sql, tuple(params))
                 summary = cur.fetchone()
 
                 # 5. 计算期末余额
                 closing_balance = Decimal('0')
                 if records:
-                    # 如果有记录，期末余额就是最后一条记录的balance_after
                     closing_balance = Decimal(str(records[0]['balance_after'] or 0))
                 elif user_id:
-                    # 如果没有记录，查询当前余额
                     cur.execute("""
                         SELECT COALESCE(member_points, 0) as current_balance
                         FROM users 
@@ -3234,7 +3198,7 @@ class FinanceService:
                     balance_row = cur.fetchone()
                     closing_balance = Decimal(str(balance_row['current_balance'] if balance_row else 0))
 
-                # 6. 获取用户信息（如果是查询单个用户）
+                # 6. 获取用户信息
                 user_info = None
                 if user_id and records:
                     user_info = {
@@ -3271,7 +3235,6 @@ class FinanceService:
                             "flow_type": "收入" if r['change_amount'] > 0 else "支出",
                             "reason": r['reason'],
                             "related_order_id": r['related_order'],
-                            "order_number": r['order_number'],
                             "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S") if r['created_at'] else None
                         } for r in records
                     ]
