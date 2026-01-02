@@ -240,6 +240,8 @@ class DatabaseManager:
                     coupon_type ENUM('user','merchant') NOT NULL,
                     amount DECIMAL(14,4) NOT NULL,
                     status ENUM('unused','used','expired') NOT NULL DEFAULT 'unused',
+                    applicable_product_type ENUM('all','normal_only','member_only') NOT NULL DEFAULT 'all' COMMENT '优惠券适
+                    用商品范围：all=不限制，normal_only=仅普通商品，member_only=仅会员商品',
                     valid_from DATE NOT NULL,
                     valid_to DATE NOT NULL,
                     used_at DATETIME DEFAULT NULL,
@@ -484,6 +486,10 @@ class DatabaseManager:
             # 联创星级分红手动调整配置字段
             'finance_accounts': {
                 'config_params': "config_params JSON DEFAULT NULL COMMENT '资金池配置参数（如：fixed_amount_per_weight）'"
+            },
+            'coupons': {
+                # 检查并添加 applicable_product_type 字段
+                'applicable_product_type': "applicable_product_type ENUM('all','normal_only','member_only') NOT NULL DEFAULT 'all' COMMENT '优惠券适用商品范围：all=不限制，normal_only=仅普通商品，member_only=仅会员商品'",
             }
         }
         
