@@ -632,20 +632,27 @@ async def set_pool_allocations(
 
 
 # ==================== 1. 优惠券发放接口 ====================
+# 在优惠券发放接口中添加 applicable_product_type 参数
 @router.post("/api/coupons/distribute", response_model=ResponseModel, summary="直接发放优惠券")
 async def distribute_coupon(
     user_id: int = Query(..., gt=0, description="用户ID"),
     amount: float = Query(..., gt=0, description="优惠券金额"),
     coupon_type: str = Query('user', pattern=r'^(user|merchant)$', description="优惠券类型"),
+    applicable_product_type: str = Query('all', pattern=r'^(all|normal_only|member_only)$', description="适用商品范围：all=不限制，normal_only=仅普通商品，member_only=仅会员商品"),  # 新增参数
     service: FinanceService = Depends(get_finance_service)
 ):
     """直接给用户发放优惠券，需扣除等额的 true_total_points（1:1）"""
     try:
-        coupon_id = service.distribute_coupon_directly(user_id, amount, coupon_type)
+        coupon_id = service.distribute_coupon_directly(
+            user_id,
+            amount,
+            coupon_type,
+            applicable_product_type  # 传递新参数
+        )
         return ResponseModel(
             success=True,
             message=f"优惠券发放成功（已扣除 true_total_points ¥{amount:.4f}）",
-            data={"coupon_id": coupon_id, "amount": amount}
+            data={"coupon_id": coupon_id, "amount": amount, "applicable_product_type": applicable_product_type}
         )
     except FinanceException as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -705,18 +712,17 @@ async def get_reward_flow(
     except Exception as e:
         logger.error(f"查询奖励流水失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-
 # ==================== 9. 优惠券使用后消失接口 ====================
 @router.post("/api/coupons/use", response_model=ResponseModel, summary="使用优惠券")
 async def use_coupon(
     coupon_id: int = Query(..., gt=0, description="优惠券ID"),
     user_id: int = Query(..., gt=0, description="用户ID"),
+    order_type: Optional[str] = Query(None, pattern=r'^(normal|member)$', description="订单商品类型（可选，用于验证优惠券适用范围）"),  # 新增参数
     service: FinanceService = Depends(get_finance_service)
 ):
     """使用优惠券，使其状态变为已使用（从列表消失）"""
     try:
-        success = service.use_coupon(coupon_id, user_id)
+        success = service.use_coupon(coupon_id, user_id, order_type)  # 传递订单类型
         if success:
             return ResponseModel(success=True, message="优惠券使用成功")
         else:
@@ -726,9 +732,6 @@ async def use_coupon(
     except Exception as e:
         logger.error(f"使用优惠券失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-# ... 在 clear_fund_pools 接口之后添加 ...
-
 @router.get("/api/reports/subsidy/weekly", response_model=ResponseModel, summary="周补贴明细报表")
 async def get_weekly_subsidy_report(
         year: int = Query(..., ge=2024, description="年份，如2025"),
@@ -1090,6 +1093,30 @@ async def get_member_points_detail_report(
     except Exception as e:
         logger.error(f"查询总会员积分明细报表失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+@router.post("/api/donate/true-total-points", response_model=ResponseModel, summary="用户捐赠点数到公益基金")
+async def donate_true_total_points(
+    user_id: int = Query(..., gt=0, description="用户ID"),
+    amount: float = Query(..., gt=0, description="捐赠金额"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """
+    用户将 true_total_points 捐赠到公益基金账户
+    - 点数与资金1:1兑换
+    - 同时记录用户点数减少和公益基金增加的流水
+    - 可在公益基金流水中查询捐赠记录
+    """
+    try:
+        result = service.donate_true_total_points(user_id, amount)
+        return ResponseModel(
+            success=True,
+            message=result["message"],
+            data=result
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"捐赠接口异常: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"捐赠失败: {str(e)}")
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])

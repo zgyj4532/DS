@@ -2027,10 +2027,11 @@ class FinanceService:
                 }
 
     def get_user_coupons(self, user_id: int, status: str = 'unused') -> List[Dict[str, Any]]:
+        """查询用户优惠券列表，包含使用范围限制信息"""
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT id, coupon_type, amount, status, valid_from, valid_to, used_at, created_at
+                    """SELECT id, coupon_type, amount, applicable_product_type, status, valid_from, valid_to, used_at, created_at
                        FROM coupons WHERE user_id = %s AND status = %s
                        ORDER BY created_at DESC""",
                     (user_id, status)
@@ -2040,6 +2041,12 @@ class FinanceService:
                     "id": c['id'],
                     "coupon_type": c['coupon_type'],
                     "amount": float(c['amount']),
+                    "applicable_product_type": c['applicable_product_type'],  # 新增
+                    "applicable_product_type_text": {  # 友好显示
+                        'all': '不限制',
+                        'normal_only': '仅普通商品',
+                        'member_only': '仅会员商品'
+                    }.get(c['applicable_product_type'], '未知'),
                     "status": c['status'],
                     "valid_from": c['valid_from'].strftime("%Y-%m-%d"),
                     "valid_to": c['valid_to'].strftime("%Y-%m-%d"),
@@ -2854,12 +2861,13 @@ class FinanceService:
 
     def distribute_coupon_directly(self, user_id: int, amount: float,
                                    coupon_type: str = 'user',
+                                   applicable_product_type: str = 'all',  # 新增参数
                                    valid_days: int = COUPON_VALID_DAYS) -> int:
-        """直接发放优惠券给用户（需扣除 true_total_points）"""
+        """直接发放优惠券给用户（需扣除等额的 true_total_points）"""
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # ========== 新增：检查 true_total_points 余额 ==========
+                    # ========== 检查 true_total_points 余额 ==========
                     select_sql = build_dynamic_select(
                         cur,
                         "users",
@@ -2881,37 +2889,37 @@ class FinanceService:
                             f"需要 {coupon_amount:.4f}（发放优惠券 ¥{amount:.2f}）"
                         )
 
-                    # ========== 原有逻辑：发放优惠券 ==========
+                    # ========== 发放优惠券 ==========
                     today = datetime.now().date()
                     valid_to = today + timedelta(days=valid_days)
 
                     cur.execute(
-                        """INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
-                           VALUES (%s, %s, %s, %s, %s, 'unused')""",
-                        (user_id, coupon_type, coupon_amount, today, valid_to)
+                        """INSERT INTO coupons (user_id, coupon_type, amount, applicable_product_type, valid_from, valid_to, status)
+                           VALUES (%s, %s, %s, %s, %s, %s, 'unused')""",
+                        (user_id, coupon_type, coupon_amount, applicable_product_type, today, valid_to)
                     )
                     coupon_id = cur.lastrowid
 
-                    # ========== 新增：扣除 true_total_points ==========
+                    # ========== 扣除 true_total_points ==========
                     new_balance = current_balance - coupon_amount
                     cur.execute(
                         "UPDATE users SET true_total_points = %s WHERE id = %s",
                         (new_balance, user_id)
                     )
 
-                    # ========== 新增：记录扣除流水 ==========
+                    # ========== 记录扣除流水 ==========
                     cur.execute(
                         """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
                            flow_type, remark, created_at)
                            VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
                         ('true_total_points', user_id, -coupon_amount, new_balance, 'expense',
-                         f"发放优惠券扣除 - 优惠券#{coupon_id}，金额¥{coupon_amount:.2f}")
+                         f"发放优惠券扣除 - 优惠券#{coupon_id}，金额¥{coupon_amount:.2f}，类型:{applicable_product_type}")
                     )
 
                     conn.commit()
 
                     logger.debug(f"发放优惠券给用户{user_id}: ID={coupon_id}, 金额¥{coupon_amount:.2f}, "
-                                 f"扣除 true_total_points {coupon_amount:.4f}")
+                                 f"类型:{applicable_product_type}, 扣除 true_total_points {coupon_amount:.4f}")
                     return coupon_id
 
         except FinanceException:
@@ -3074,57 +3082,57 @@ class FinanceService:
                 }
 
     # ==================== 4. 优惠券使用（消失）- 增强流水记录 ====================
-    def use_coupon(self, coupon_id: int, user_id: int) -> bool:
-        """使用优惠券，使其状态变为已使用，并记录流水"""
+    def use_coupon(self, coupon_id: int, user_id: int, order_type: str = None) -> bool:
+        """使用优惠券，验证商品类型匹配性"""
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # 使用条件更新原子性标记优惠券为已使用，避免长事务锁等待
-                    today = datetime.now().date()
+                    # 1. 查询优惠券详情
                     cur.execute(
-                        """UPDATE coupons SET status = 'used', used_at = NOW()
-                           WHERE id = %s AND user_id = %s AND status = 'unused' AND valid_from <= %s AND valid_to >= %s""",
-                        (coupon_id, user_id, today, today)
+                        """SELECT c.*, u.name as user_name
+                           FROM coupons c JOIN users u ON c.user_id = u.id
+                           WHERE c.id = %s AND c.user_id = %s AND c.status = 'unused'""",
+                        (coupon_id, user_id)
                     )
-                    if cur.rowcount == 0:
-                        raise FinanceException("优惠券不存在、已使用或不在有效期内")
-
-                    # 查询已被标记的优惠券金额
-                    cur.execute("SELECT amount FROM coupons WHERE id = %s", (coupon_id,))
                     coupon = cur.fetchone()
-                    coupon_amount = Decimal(str(coupon['amount'] or 0))
 
-                    # 更新优惠券状态为已使用（已在条件更新中完成）
+                    if not coupon:
+                        raise FinanceException("优惠券不存在或已使用")
+
+                    # 2. 验证有效期
+                    today = datetime.now().date()
+                    if not (coupon['valid_from'] <= today <= coupon['valid_to']):
+                        raise FinanceException("优惠券不在有效期内")
+
+                    # 3. 验证商品类型匹配（如果提供了订单类型）
+                    if order_type:
+                        applicable_type = coupon['applicable_product_type']
+                        if applicable_type == 'normal_only' and order_type == 'member':
+                            raise FinanceException("该优惠券仅限普通商品使用")
+                        if applicable_type == 'member_only' and order_type == 'normal':
+                            raise FinanceException("该优惠券仅限会员商品使用")
+
+                    # 4. 标记为已使用
                     cur.execute(
                         "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s",
                         (coupon_id,)
                     )
 
-                    # 记录优惠券使用流水（在当前事务的同一 cursor 上执行，保证原子性）
-                    # 获取对应账户的当前余额（finance_accounts 表）
-                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", ('coupon',))
-                    row = cur.fetchone()
-                    balance_after = Decimal(str(row.get('balance') or 0)) if row else Decimal('0')
+                    # 5. 记录使用流水
                     cur.execute(
-                        """INSERT INTO account_flow (account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""",
-                        (None, 'coupon', user_id, Decimal('0'), balance_after, 'expense', f"用户使用优惠券 - 优惠券#{coupon_id}，抵扣金额¥{coupon_amount:.2f}")
-                    )
-
-                    # 记录平台获得优惠券抵扣额（在当前事务内使用同一 cursor）
-                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", ('coupon_revenue',))
-                    row2 = cur.fetchone()
-                    balance_after2 = Decimal(str(row2.get('balance') or 0)) if row2 else Decimal('0')
-                    cur.execute(
-                        """INSERT INTO account_flow (account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""",
-                        (None, 'coupon_revenue', PLATFORM_MERCHANT_ID, coupon_amount, balance_after2, 'income', f"优惠券抵扣额记录 - 优惠券#{coupon_id}，用户{user_id}使用，金额¥{coupon_amount:.2f}")
+                        """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                           flow_type, remark, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                        ('coupon', user_id, Decimal('0'), Decimal('0'), 'expense',
+                         f"用户使用优惠券 - 优惠券#{coupon_id}，金额¥{float(coupon['amount'])}, 类型:{coupon['applicable_product_type']}")
                     )
 
                     conn.commit()
-                    logger.debug(f"用户{user_id}使用优惠券{coupon_id}:¥{coupon_amount}成功")
+                    logger.debug(f"用户{user_id}使用优惠券{coupon_id}:¥{coupon['amount']:.2f}成功")
                     return True
 
+        except FinanceException as e:
+            raise
         except Exception as e:
             logger.error(f"❌ 使用优惠券失败: {e}")
             raise
@@ -5317,23 +5325,29 @@ class FinanceService:
                 total_count = af_total + wsr_total
 
                 # ==================== 6. 格式化返回数据 ====================
-                flow_type_mapping = {
+                flow_type_base_mapping = {
                     'subsidy_points': '周补贴收入',
                     'referral_points': '推荐奖励收入',
                     'team_reward_points': '团队奖励收入',
                     'honor_director': '联创星级收入',
-                    'true_total_points': '优惠券扣减'
+                    'true_total_points': '优惠券扣减'  # 默认值
                 }
 
                 detailed_records = []
                 for r in all_records:
                     account_type = r['account_type']
-                    flow_type_label = flow_type_mapping.get(account_type, account_type)
+                    remark = r.get('remark', '')
 
-                    flow_category = '支出' if account_type == 'true_total_points' else '收入'
-                    change_amount = float(r['change_amount'])
-                    if account_type == 'true_total_points':
-                        change_amount = -abs(change_amount)  # 确保是负值
+                    # 智能识别flow_type：如果是true_total_points且remark包含"捐赠"，显示为"用户捐赠"
+                    if account_type == 'true_total_points' and '捐赠' in remark:
+                        flow_type_label = '用户捐赠'
+                        flow_category = '支出'
+                        # 确保change_amount为负值
+                        change_amount = -abs(float(r['change_amount']))
+                    else:
+                        flow_type_label = flow_type_base_mapping.get(account_type, account_type)
+                        flow_category = '支出' if account_type == 'true_total_points' else '收入'
+                        change_amount = float(r['change_amount'])
 
                     # 确保 created_at 是 datetime 对象
                     created_at = r['created_at']
@@ -5402,6 +5416,111 @@ class FinanceService:
                     },
                     'records': detailed_records
                 }
+    def donate_true_total_points(self, user_id: int, amount: float) -> Dict[str, Any]:
+        """
+        用户捐赠 true_total_points 到公益基金账户（1:1兑换为资金）
+
+        Args:
+            user_id: 用户ID
+            amount: 捐赠的点数金额
+
+        Returns:
+            dict: 包含捐赠结果和流水ID的字典
+        """
+        logger.info(f"用户 {user_id} 申请捐赠 true_total_points: {amount:.4f}")
+
+        donation_amount = Decimal(str(amount))
+        if donation_amount <= 0:
+            raise FinanceException("捐赠金额必须大于0")
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # 1. 查询用户当前 true_total_points 余额
+                    select_sql = build_dynamic_select(
+                        cur,
+                        "users",
+                        where_clause="id=%s",
+                        select_fields=["true_total_points", "name"]
+                    )
+                    cur.execute(select_sql, (user_id,))
+                    user_row = cur.fetchone()
+
+                    if not user_row:
+                        raise FinanceException(f"用户不存在: {user_id}")
+
+                    current_balance = Decimal(str(user_row.get('true_total_points', 0) or 0))
+                    user_name = user_row.get('name', f'用户{user_id}')
+
+                    # 2. 检查余额是否充足
+                    if current_balance < donation_amount:
+                        raise FinanceException(
+                            f"用户 true_total_points 余额不足，当前余额: {current_balance:.4f}，"
+                            f"需要 {donation_amount:.4f}"
+                        )
+
+                    # 3. 扣除用户 true_total_points
+                    new_balance = current_balance - donation_amount
+                    cur.execute(
+                        "UPDATE users SET true_total_points = %s WHERE id = %s",
+                        (new_balance, user_id)
+                    )
+
+                    # 4. 增加公益基金账户余额
+                    cur.execute(
+                        "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'public_welfare'",
+                        (donation_amount,)
+                    )
+
+                    # 5. 查询公益基金更新后的余额
+                    cur.execute(
+                        "SELECT balance FROM finance_accounts WHERE account_type = 'public_welfare'"
+                    )
+                    welfare_balance_row = cur.fetchone()
+                    welfare_balance_after = Decimal(str(welfare_balance_row.get('balance', 0) or 0))
+
+                    # 6. 记录用户点数扣除流水（支出）
+                    cur.execute(
+                        """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                           flow_type, remark, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                        ('true_total_points', user_id, -donation_amount, new_balance, 'expense',
+                         f"用户捐赠true_total_points到公益基金 - 捐赠金额¥{donation_amount:.4f}")
+                    )
+                    expense_flow_id = cur.lastrowid
+
+                    # 7. 记录公益基金账户收入流水
+                    cur.execute(
+                        """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                           flow_type, remark, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                        ('public_welfare', user_id, donation_amount, welfare_balance_after, 'income',
+                         f"用户 {user_name}(ID:{user_id}) 捐赠true_total_points - 捐赠金额¥{donation_amount:.4f}")
+                    )
+                    income_flow_id = cur.lastrowid
+
+                    conn.commit()
+
+                    logger.info(
+                        f"用户 {user_id} 捐赠成功: -{donation_amount:.4f} true_total_points, "
+                        f"公益基金 +{donation_amount:.4f}"
+                    )
+
+                    return {
+                        "success": True,
+                        "donation_amount": float(donation_amount),
+                        "user_balance_after": float(new_balance),
+                        "welfare_balance_after": float(welfare_balance_after),
+                        "expense_flow_id": expense_flow_id,
+                        "income_flow_id": income_flow_id,
+                        "message": f"捐赠成功，感谢您的爱心！"
+                    }
+
+        except FinanceException:
+            raise
+        except Exception as e:
+            logger.error(f"❌ 用户 {user_id} 捐赠失败: {e}")
+            raise FinanceException(f"捐赠失败: {e}")
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
 def _build_team_rewards_select(cursor, asset_fields: List[str] = None) -> tuple:

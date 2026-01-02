@@ -462,7 +462,7 @@ def create_order(body: OrderCreate):
 
 @router.post("/pay", summary="订单支付")
 def order_pay(body: OrderPay):
-    """支付回调：完成财务结算后再把订单状态改为待发货"""
+    """支付回调：完成财务结算前验证优惠券适用范围，验证通过后完成财务结算并更新订单状态"""
     if body.pay_way not in VALID_PAY_WAYS:
         raise HTTPException(status_code=422, detail="非法支付方式")
 
@@ -505,19 +505,51 @@ def order_pay(body: OrderPay):
                 total_points_to_use = body.points_to_use
                 logger.debug(f"用户{user_id}使用积分{total_points_to_use}分")
 
-            # 3.2 处理优惠券抵扣（不转换为积分）
+            # 3.2 处理优惠券抵扣（增强验证）
             if body.coupon_id:
+                # 查询优惠券详情（包含适用范围和有效期）
                 cur.execute(
-                    "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s AND user_id = %s AND status = 'unused'",
+                    """SELECT c.id, c.amount, c.applicable_product_type, c.valid_from, c.valid_to 
+                       FROM coupons c 
+                       WHERE c.id = %s AND c.user_id = %s AND c.status = 'unused'""",
                     (body.coupon_id, user_id)
                 )
-                if cur.rowcount == 0:
+                coupon = cur.fetchone()
+                if not coupon:
                     raise HTTPException(status_code=400, detail="优惠券不存在或已使用")
 
-                cur.execute("SELECT amount FROM coupons WHERE id = %s", (body.coupon_id,))
-                coupon = cur.fetchone()
+                # 验证有效期
+                today = datetime.now().date()
+                if not (coupon['valid_from'] <= today <= coupon['valid_to']):
+                    raise HTTPException(status_code=400, detail="优惠券不在有效期内")
+
+                # 验证商品类型匹配：查询订单中的商品类型
+                cur.execute("""
+                    SELECT DISTINCT p.is_member_product 
+                    FROM order_items oi 
+                    JOIN products p ON oi.product_id = p.id 
+                    WHERE oi.order_id = %s
+                """, (order_id,))
+                order_product_types = cur.fetchall()
+
+                has_member_product = any(p['is_member_product'] for p in order_product_types)
+                has_normal_product = any(not p['is_member_product'] for p in order_product_types)
+
+                # 验证优惠券适用范围
+                applicable_type = coupon['applicable_product_type']
+                if applicable_type == 'normal_only' and has_member_product:
+                    raise HTTPException(status_code=400, detail="该优惠券仅限普通商品使用")
+                if applicable_type == 'member_only' and not has_member_product:
+                    raise HTTPException(status_code=400, detail="该优惠券仅限会员商品使用")
+
+                # 验证通过，标记优惠券为已使用
+                cur.execute(
+                    "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s",
+                    (body.coupon_id,)
+                )
+
                 coupon_amount = Decimal(str(coupon['amount']))
-                logger.debug(f"用户{user_id}使用优惠券#{body.coupon_id}: 金额¥{coupon_amount}")
+                logger.debug(f"用户{user_id}使用优惠券#{body.coupon_id}: 金额¥{coupon_amount}, 类型:{applicable_type}")
 
             # 4. 财务结算（传入分离的参数）
             fs = FinanceService()
