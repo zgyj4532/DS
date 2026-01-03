@@ -563,70 +563,92 @@ def user_list(
             total = cur.fetchone()["c"]
             return {"rows": rows, "total": total, "page": page, "size": size}
 
-@router.post("/user/bind-referrer", summary="绑定推荐人（支持推荐码或手机号）")
+
+@router.post("/user/bind-referrer", summary="绑定推荐人（防重复/防循环/支持推荐码或手机号）")
 def bind_referrer(body: BindReferrerReq):
     """
     优先级：referrer_code > referrer_mobile > 跳过
+    限制：已有推荐人时禁止重复绑定，防止循环推荐关系
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 1. 被推荐人必须存在
-            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
+            # ========== 1. 被推荐人验证 ==========
+            select_sql = build_dynamic_select(cur, "users",
+                                              where_clause="mobile=%s", select_fields=["id", "status"])
             cur.execute(select_sql, (body.mobile,))
             u = cur.fetchone()
-            if not u:
-                raise HTTPException(status_code=404, detail="被推荐人不存在")
+            if not u or u["status"] == UserStatus.DELETED.value:
+                raise HTTPException(status_code=404, detail="被推荐人不存在或已注销")
             user_id = u["id"]
 
-            # 2. 确定推荐人 ID
+            # ========== 2. 防重复绑定（核心防护） ==========
+            cur.execute("SELECT referrer_id FROM user_referrals WHERE user_id=%s", (user_id,))
+            existing_referrer = cur.fetchone()
+            if existing_referrer:
+                raise HTTPException(
+                    status_code=400,
+                    detail="已有推荐人，不能重复绑定"
+                )
+
+            # ========== 3. 确定推荐人ID ==========
             referrer_id = None
-            if body.referrer_code:                      # ① 优先用推荐码
-                select_sql = build_dynamic_select(cur, "users", where_clause="referral_code=%s", select_fields=["id"])
-                cur.execute(select_sql, (body.referrer_code.upper(),))  # 推荐码统一大写
+            if body.referrer_code:  # 优先用推荐码
+                select_sql = build_dynamic_select(cur, "users",
+                                                  where_clause="referral_code=%s", select_fields=["id", "status"])
+                cur.execute(select_sql, (body.referrer_code.upper(),))
                 ref = cur.fetchone()
-                if not ref:
-                    raise HTTPException(status_code=404, detail="推荐码不存在")
+                if not ref or ref["status"] == UserStatus.DELETED.value:
+                    raise HTTPException(status_code=404, detail="推荐人不存在或已注销")
                 referrer_id = ref["id"]
-            elif body.referrer_mobile:                  # ② 其次用手机号
-                select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
+            elif body.referrer_mobile:  # 其次用手机号
+                select_sql = build_dynamic_select(cur, "users",
+                                                  where_clause="mobile=%s", select_fields=["id", "status"])
                 cur.execute(select_sql, (body.referrer_mobile,))
                 ref = cur.fetchone()
-                if not ref:
-                    raise HTTPException(status_code=404, detail="推荐人手机号不存在")
+                if not ref or ref["status"] == UserStatus.DELETED.value:
+                    raise HTTPException(status_code=404, detail="推荐人不存在或已注销")
                 referrer_id = ref["id"]
+            else:
+                return {"msg": "ok"}  # 无推荐人直接返回
 
-            # 3. 无推荐人直接返回成功（跳过绑定）
-            if referrer_id is None:
-                return {"msg": "ok"}
+            # ========== 4. 防循环推荐（核心防护） ==========
+            if UserService._is_ancestor(referrer_id, user_id):
+                raise HTTPException(
+                    status_code=400,
+                    detail="不能绑定自己的下级，防止形成循环推荐关系"
+                )
 
-            # 4. 自动建表 & 幂等写入（ON DUPLICATE KEY UPDATE）
+            # ========== 5. 写入推荐关系 ==========
+            # 自动建表（兼容老库）
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_referrals (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     user_id INT NOT NULL,
                     referrer_id INT NOT NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE KEY uk_uid (user_id)
+                    UNIQUE KEY uk_uid (user_id),
+                    KEY idx_referrer (referrer_id)
                 )
             """)
+
+            # 写入数据
             cur.execute(
-                "INSERT INTO user_referrals(user_id, referrer_id) VALUES (%s,%s) "
-                "ON DUPLICATE KEY UPDATE referrer_id=%s",
-                (user_id, referrer_id, referrer_id)
+                "INSERT INTO user_referrals(user_id, referrer_id) VALUES (%s,%s)",
+                (user_id, referrer_id)
             )
-            # 同步更新 users 表中的 referral_id 字段（若不存在则自动创建）
-            cur.execute("SHOW COLUMNS FROM users")
-            user_cols2 = [r['Field'] for r in cur.fetchall()]
-            if "referral_id" not in user_cols2:
+
+            # 同步更新 users.referral_id 字段（若不存在则自动创建）
+            cur.execute("SHOW COLUMNS FROM users LIKE 'referral_id'")
+            if not cur.fetchone():
                 cur.execute(
                     "ALTER TABLE users ADD COLUMN referral_id INT DEFAULT NULL COMMENT '推荐人ID'"
                 )
-                conn.commit()  # 提交 DDL
 
-            # 更新 users.referral_id 为绑定的推荐人 id
             cur.execute("UPDATE users SET referral_id=%s WHERE id=%s", (referrer_id, user_id))
             conn.commit()
-            return {"msg": "ok"}
+
+            logger.info(f"推荐绑定成功: 用户ID={user_id}, 推荐人ID={referrer_id}")
+            return {"msg": "绑定成功"}
 
 @router.get("/user/refer-direct", summary="直推列表")
 def refer_direct(mobile: str, page: int = 1, size: int = 10):
