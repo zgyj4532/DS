@@ -522,17 +522,19 @@ def user_info(mobile: str):
         referrer=referrer
     )
 
-@router.get("/user/list", summary="分页列表+筛选")
+
+@router.get("/user/list", summary="分页用户列表+筛选")
 def user_list(
-    id_start: int = None,
-    id_end: int = None,
-    level_start: int = 0,
-    level_end: int = 6,
-    page: int = 1,
-    size: int = 20,
+        id_start: int = None,
+        id_end: int = None,
+        level_start: int = 0,
+        level_end: int = 6,
+        page: int = 1,
+        size: int = 20,
 ):
     if level_start > level_end or (id_start is not None and id_end is not None and id_start > id_end):
         _err("区间左值不能大于右值")
+
     where, args = [], []
     if id_start is not None:
         where.append("id >= %s")
@@ -542,9 +544,17 @@ def user_list(
         args.append(id_end)
     where.append("member_level BETWEEN %s AND %s")
     args.extend([level_start, level_end])
+
     sql_where = "WHERE " + " AND ".join(where) if where else ""
-    limit_sql = "LIMIT %s OFFSET %s"
-    args.extend([size, (page - 1) * size])
+
+    # ❌ 删除或注释掉以下两行
+    # limit_sql = "LIMIT %s OFFSET %s"
+    # args.extend([size, (page - 1) * size])
+
+    # ✅ 新增：直接生成 MySQL 风格的 limit 字符串
+    offset = (page - 1) * size
+    limit_str = f"{offset}, {size}"
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             # 使用动态表访问构造查询
@@ -553,15 +563,17 @@ def user_list(
                 "users",
                 where_clause=sql_where.replace("WHERE ", "") if sql_where else None,
                 order_by="id",
-                limit=limit_sql.replace("LIMIT ", "") if limit_sql else None,
+                limit=limit_str,  # ✅ 直接传入确定的字符串
                 select_fields=["id", "mobile", "name", "member_level", "created_at"]
             )
             cur.execute(select_sql, tuple(args))
             rows = cur.fetchall()
+
             # COUNT 查询
             count_sql = f"SELECT COUNT(*) AS c FROM users {sql_where}"
-            cur.execute(count_sql, tuple(args[:-2]))
+            cur.execute(count_sql, tuple(args))  # ✅ 移除 [:-2]
             total = cur.fetchone()["c"]
+
             return {"rows": rows, "total": total, "page": page, "size": size}
 
 
