@@ -5,12 +5,25 @@ from typing import Final
 import os
 from dotenv import load_dotenv
 from pathlib import Path
+
 # 加载环境变量
 load_dotenv()
 
+# ==================== JWT配置 ====================
+JWT_SECRET_KEY: Final[str] = os.getenv("JWT_SECRET_KEY", "")
+if not JWT_SECRET_KEY:
+    raise RuntimeError("必须在 .env 中配置 JWT_SECRET_KEY")
+JWT_ALGORITHM: Final[str] = "HS256"
+JWT_EXPIRE_MINUTES: Final[int] = int(os.getenv("JWT_EXPIRE_MINUTES", 1440))  # 默认24小时
+
+# 双认证开关
+ENABLE_UUID_AUTH: Final[int] = int(os.getenv("ENABLE_UUID_AUTH", "0"))
 
 # ==================== 应用配置 ====================
 UVICORN_PORT: int = int(os.getenv('UVICORN_PORT') or 8000)
+DRAFT_EXPIRE_DAYS: int = int(os.getenv('DRAFT_EXPIRE_DAYS') or 7)
+MAX_FILE_SIZE_MB: int = int(os.getenv('MAX_FILE_SIZE_MB') or 10)
+
 # ==================== 数据库配置 ====================
 def get_db_config():
     """获取数据库配置字典"""
@@ -26,7 +39,6 @@ def get_db_config():
     if missing:
         raise RuntimeError(f"缺少必要的数据库环境变量: {', '.join(missing)}\n")
     return cfg
-
 
 # ==================== 平台常量 ====================
 PLATFORM_MERCHANT_ID: Final[int] = 0
@@ -160,3 +172,16 @@ CATEGORY_CHOICES: Final[list[str]] = [
     "服装鞋帽", "家居生活", "美妆护肤", "母婴用品",
     "食品饮料", "数码电器", "图书文具", "运动户外", "其他"
 ]
+
+# 微信支付配置
+WECHAT_PAY_MCH_ID = os.getenv("WECHAT_PAY_MCH_ID", "")
+WECHAT_PAY_API_V3_KEY = os.getenv("WECHAT_PAY_API_V3_KEY", "")  # 重命名
+WECHAT_PAY_API_CERT_PATH = os.getenv("WECHAT_PAY_API_CERT_PATH", "")
+WECHAT_PAY_API_KEY_PATH = os.getenv("WECHAT_PAY_API_KEY_PATH", "")
+WECHAT_PAY_PLATFORM_CERT_PATH = os.getenv("WECHAT_PAY_PLATFORM_CERT_PATH", "")  # 新增
+WECHAT_PAY_PUBLIC_KEY_PATH = os.getenv("WECHAT_PAY_PUBLIC_KEY_PATH", "")        # 新增
+WECHAT_PAY_NOTIFY_URL = os.getenv("WECHAT_PAY_NOTIFY_URL", "")
+WECHAT_APP_SECRET = os.getenv("WECHAT_APP_SECRET", "")
+
+# 推送配置
+PUSH_TEMPLATE_ID_APPLYMENT = os.getenv("PUSH_TEMPLATE_ID_APPLYMENT", "")        # 新增

@@ -13,6 +13,7 @@ from core.middleware import setup_cors, setup_static_files
 from core.config import get_db_config, PIC_PATH, AVATAR_UPLOAD_DIR,UVICORN_PORT
 from core.logging import setup_logging
 from database_setup import initialize_database
+from api.wechat_pay.routes import register_wechat_pay_routes
 
 # 配置日志（如果需要同时输出到控制台，可以设置 log_to_console=True）
 setup_logging(log_to_file=True, log_to_console=True)
@@ -26,6 +27,7 @@ from api.user.routes import register_routes as register_user_routes
 from api.order import register_routes as register_order_routes
 from api.product.routes import register_routes as register_product_routes
 from api.system.routes import register_routes as register_system_routes
+from api.wechat_applyment.routes import register_wechat_applyment_routes
 
 
 def ensure_database():
@@ -85,6 +87,10 @@ tags_metadata = [
         "name": "系统配置",
         "description": "系统配置相关接口，包括系统标语、轮播图标语等配置管理。",
     },
+    {
+        "name": "微信进件",
+        "description": "微信支付进件相关接口，包括实名认证、进件申请、材料上传、状态查询等功能。",
+    },
 ]
 
 # 更新 OpenAPI Schema 的 tags 元数据
@@ -103,6 +109,8 @@ register_user_routes(app)
 register_order_routes(app)
 register_product_routes(app)
 register_system_routes(app)
+register_wechat_applyment_routes(app)  # 添加这一行
+register_wechat_pay_routes(app)
 
 
 # 自定义 OpenAPI Schema 生成函数，确保只显示定义的4个标签
@@ -186,7 +194,7 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=post,
-        reload=True,  # 热重载已启用
+        reload=False,  # 热重载已启用
         log_level="info",
         access_log=True
     )

@@ -89,13 +89,16 @@ class DatabaseManager:
                     six_director INT NULL DEFAULT 0 COMMENT '直推六星人数，用于荣誉董事晋升判定',
                     six_team INT NULL DEFAULT 0 COMMENT '团队六星人数，用于荣誉董事晋升判定',
                     wechat_sub_mchid VARCHAR(32) NULL DEFAULT NULL COMMENT '微信特约商户号',
+                    openid VARCHAR(128) NULL DEFAULT NULL COMMENT '微信小程序openid',
+                    token VARCHAR(64) NULL COMMENT 'UUID认证token（仅开发环境）',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_mobile (mobile),
                     INDEX idx_email (email),
                     INDEX idx_member_level (member_level),
                     INDEX idx_wechat_sub_mchid (wechat_sub_mchid),
-                    UNIQUE KEY uk_referral_code (referral_code)
+                    UNIQUE KEY uk_referral_code (referral_code),
+                    INDEX idx_token (token)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'products': """
@@ -605,12 +608,12 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS user_bankcard_operations (
                     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT UNSIGNED NOT NULL COMMENT '用户ID',
-                    operation_type VARCHAR(50) NOT NULL COMMENT '操作类型：bind/unbind/set_default/verify等',
-                    target_id BIGINT UNSIGNED NULL COMMENT '关联的银行卡ID（user_bankcards.id）',
+                    operation_type VARCHAR(50) NOT NULL COMMENT '操作类型：bind/unbind/set_default/verify',
+                    target_id BIGINT UNSIGNED NULL COMMENT '关联的结算账户ID(merchant_settlement_accounts.id)',
                     old_val JSON NULL COMMENT '旧值（JSON）',
                     new_val JSON NULL COMMENT '新值（JSON）',
                     remark TEXT NULL COMMENT '操作详情',
-                    admin_key VARCHAR(100) NULL COMMENT '管理员标识',
+                    admin_key VARCHAR(100) NULL COMMENT '管理员标识(SYSTEM表示系统操作)',
                     ip_address VARCHAR(45) NULL COMMENT 'IP地址',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_user_id (user_id),
@@ -680,6 +683,13 @@ class DatabaseManager:
         self._add_user_unilevel_foreign_keys(cursor)
         self._add_directors_foreign_keys(cursor)
         self._add_director_dividends_foreign_keys(cursor)
+
+        # ========== 微信进件模块外键约束 ==========
+        self._add_wx_applyment_foreign_keys(cursor)
+        self._add_wx_applyment_media_foreign_keys(cursor)
+        self._add_merchant_settlement_accounts_foreign_keys(cursor)
+        self._add_merchant_realname_verification_foreign_keys(cursor)
+        self._add_user_bankcard_operations_foreign_keys(cursor)
 
         self._init_finance_accounts(cursor)
         logger.info("数据库表结构初始化完成")
@@ -1013,11 +1023,11 @@ class DatabaseManager:
                 AND TABLE_NAME IN ('director_dividends', 'users')
             """)
             existing_tables = {row['TABLE_NAME'] for row in cursor.fetchall()}
-            
+
             if 'director_dividends' not in existing_tables or 'users' not in existing_tables:
                 logger.debug("⚠️ director_dividends 表或 users 表不存在，跳过外键添加")
                 return
-            
+
             cursor.execute("""
                 SELECT CONSTRAINT_NAME 
                 FROM information_schema.TABLE_CONSTRAINTS 
@@ -1026,7 +1036,7 @@ class DatabaseManager:
                 AND CONSTRAINT_TYPE = 'FOREIGN KEY'
             """)
             existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
-            
+
             if 'director_dividends_ibfk_1' not in existing_fks:
                 cursor.execute("""
                     ALTER TABLE director_dividends 
@@ -1036,6 +1046,47 @@ class DatabaseManager:
                 logger.debug("director_dividends 表外键约束 director_dividends_ibfk_1 已添加")
         except Exception as e:
             logger.debug(f"⚠️ director_dividends 表外键约束添加失败（已忽略）: {e}")
+
+    def _add_wx_applyment_foreign_keys(self, cursor):
+        """微信进件主表外键"""
+        try:
+            cursor.execute("ALTER TABLE wx_applyment ADD CONSTRAINT fk_wx_applyment_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            logger.debug("✅ wx_applyment 外键已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ wx_applyment 外键添加失败: {e}")
+
+    def _add_wx_applyment_media_foreign_keys(self, cursor):
+        """进件材料表外键"""
+        try:
+            cursor.execute("ALTER TABLE wx_applyment_media ADD CONSTRAINT fk_media_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            logger.debug("✅ wx_applyment_media 外键已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ wx_applyment_media 外键添加失败: {e}")
+
+    def _add_merchant_settlement_accounts_foreign_keys(self, cursor):
+        """结算账户表外键"""
+        try:
+            cursor.execute("ALTER TABLE merchant_settlement_accounts ADD CONSTRAINT fk_merchant_account_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            logger.debug("✅ merchant_settlement_accounts 外键已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ merchant_settlement_accounts 外键添加失败: {e}")
+
+    def _add_merchant_realname_verification_foreign_keys(self, cursor):
+        """实名认证表外键"""
+        try:
+            cursor.execute("ALTER TABLE merchant_realname_verification ADD CONSTRAINT fk_realname_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            logger.debug("✅ merchant_realname_verification 外键已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ merchant_realname_verification 外键添加失败: {e}")
+
+    def _add_user_bankcard_operations_foreign_keys(self, cursor):
+        """银行卡操作日志表外键"""
+        try:
+            cursor.execute("ALTER TABLE user_bankcard_operations ADD CONSTRAINT fk_bankcard_op_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            cursor.execute("ALTER TABLE user_bankcard_operations ADD CONSTRAINT fk_bankcard_op_target FOREIGN KEY (target_id) REFERENCES merchant_settlement_accounts(id) ON DELETE CASCADE")
+            logger.debug("✅ user_bankcard_operations 外键已添加")
+        except Exception as e:
+            logger.warning(f"⚠️ user_bankcard_operations 外键添加失败: {e}")
 
     def _init_finance_accounts(self, cursor):
         accounts = [
@@ -1327,3 +1378,31 @@ def _fix_pinyin():
         logger.warning("⚠️ pypinyin 未安装，跳过拼音补全功能")
     except Exception as e:
         logger.error(f"❌ 拼音补全失败: {e}")
+
+
+
+# 在文件末尾添加
+def start_background_tasks():
+    """启动后台任务"""
+    from core.scheduler import scheduler
+    scheduler.start()
+
+# 在 initialize_database 函数后调用
+def initialize_database():
+    """初始化数据库表结构（如果尚未创建）"""
+    print("正在检查数据库表结构...")
+    create_database()
+
+    cfg = get_db_config()
+    conn = pymysql.connect(**cfg, cursorclass=pymysql.cursors.DictCursor)
+    try:
+        with conn.cursor() as cursor:
+            db_manager = DatabaseManager()
+            db_manager.init_all_tables(cursor)
+        conn.commit()
+    finally:
+        conn.close()
+
+    print("数据库表结构初始化完成。")
+    print("启动后台任务...")
+    start_background_tasks()
