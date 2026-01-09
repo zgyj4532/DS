@@ -183,5 +183,18 @@ WECHAT_PAY_PUBLIC_KEY_PATH = os.getenv("WECHAT_PAY_PUBLIC_KEY_PATH", "")        
 WECHAT_PAY_NOTIFY_URL = os.getenv("WECHAT_PAY_NOTIFY_URL", "")
 WECHAT_APP_SECRET = os.getenv("WECHAT_APP_SECRET", "")
 
+# 向后兼容：某些模块仍然使用 `WX_MCHID` 名称
+from typing import Final
+WX_MCHID: Final[str] = os.getenv("WX_MCHID") or WECHAT_PAY_MCH_ID
+
+# 向后兼容：常用的 WX_* 命名，优先读取 WX_* 环境变量，否则回退到 WECHAT_PAY_*
+WX_CERT_SERIAL_NO: Final[str] = os.getenv("WX_CERT_SERIAL_NO") or os.getenv("WECHAT_PAY_CERT_SERIAL_NO", "")
+WX_APIV3_KEY: Final[str] = os.getenv("WX_APIV3_KEY") or WECHAT_PAY_API_V3_KEY
+WX_PRIVATE_KEY_PATH: Final[str] = os.getenv("WX_PRIVATE_KEY_PATH") or WECHAT_PAY_API_KEY_PATH
+WX_PAY_BASE_URL: Final[str] = os.getenv("WX_PAY_BASE_URL") or os.getenv("WECHAT_PAY_BASE_URL") or "https://api.mch.weixin.qq.com"
+# 平台公钥/证书路径（兼容多个环境变量名）
+WECHATPAY_CERT_PATH: Final[str] = os.getenv("WECHATPAY_CERT_PATH") or WECHAT_PAY_PLATFORM_CERT_PATH or WECHAT_PAY_PUBLIC_KEY_PATH
+WX_WECHATPAY_SERIAL: Final[str] = os.getenv("WX_WECHATPAY_SERIAL") or os.getenv("WECHATPAY_SERIAL") or ""
+
 # 推送配置
 PUSH_TEMPLATE_ID_APPLYMENT = os.getenv("PUSH_TEMPLATE_ID_APPLYMENT", "")        # 新增
