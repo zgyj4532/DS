@@ -3,7 +3,7 @@ import asyncio
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from core.database import get_conn
-from core.wechat_pay_client import WechatPayClient
+from core.wx_pay_client import WeChatPayClient  # ✅ 修复：WechatPayClient → WeChatPayClient
 import logging
 from datetime import datetime, timedelta
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class TaskScheduler:
     def __init__(self):
         self.scheduler = BackgroundScheduler()
-        self.pay_client = WechatPayClient()
+        self.pay_client = WeChatPayClient()  # ✅ 修复：WechatPayClient → WeChatPayClient
 
     def start(self):
         """启动所有定时任务"""

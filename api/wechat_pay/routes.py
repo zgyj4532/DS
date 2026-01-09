@@ -1,6 +1,6 @@
 # api/wechat_pay/routes.py
 from fastapi import APIRouter, Request, HTTPException
-from core.wechat_pay_client import WechatPayClient
+from core.wx_pay_client import WeChatPayClient  # ✅ 修复：wechat_pay_client → wx_pay_client，WechatPayClient → WeChatPayClient
 from core.response import success_response
 from core.database import get_conn
 from services.wechat_applyment_service import WechatApplymentService
@@ -10,7 +10,7 @@ import logging
 router = APIRouter(prefix="/wechat-pay", tags=["微信支付"])
 
 logger = logging.getLogger(__name__)
-pay_client = WechatPayClient()
+pay_client = WeChatPayClient()  # ✅ 修复：WechatPayClient → WeChatPayClient
 
 
 @router.post("/notify", summary="微信支付回调通知")

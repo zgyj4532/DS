@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Any
 from fastapi import HTTPException, UploadFile
 from core.database import get_conn
 from core.config import WECHAT_PAY_MCH_ID, WECHAT_PAY_API_V3_KEY, DRAFT_EXPIRE_DAYS, MAX_FILE_SIZE_MB
-from core.wechat_pay_client import WechatPayClient
+from core.wx_pay_client import WeChatPayClient  # ✅ 修复：WechatPayClient → WeChatPayClient
 from core.push_service import push_service
 from core.table_access import build_dynamic_select, build_dynamic_insert, build_dynamic_update
 import logging
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class WechatApplymentService:
     def __init__(self):
-        self.pay_client = WechatPayClient()
+        self.pay_client = WeChatPayClient()  # ✅ 修复：WechatPayClient → WeChatPayClient
         self.max_file_size = MAX_FILE_SIZE_MB * 1024 * 1024
 
     def _get_realname_data(self, user_id: int) -> Optional[Dict[str, Any]]:

@@ -2,24 +2,26 @@
 import base64
 import json
 import os
-
+import re
+import uuid  # ✅ 添加这行
 import pymysql
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 from core.database import get_conn
 from core.logging import get_logger
 from core.wx_pay_client import wxpay_client
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from core.table_access import build_dynamic_select, build_dynamic_insert, build_dynamic_update
+from fastapi import HTTPException
 
 logger = get_logger(__name__)
 
 
 class BankcardService:
-    """银行卡管理服务 - 微信接口验证版"""
+    """统一银行卡管理服务 - 支持绑定、改绑、解绑、查询完整生命周期"""
 
     @staticmethod
     def _get_wechat_settlement_info_from_api(user_id: int) -> Tuple[str, Dict[str, Any]]:
-        """【Mock/真实】获取结算账户信息"""
+        """【Mock/真实】获取微信结算账户信息"""
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -78,10 +80,6 @@ class BankcardService:
         except Exception as e:
             return False, f"验证异常: {str(e)}"
 
-    # services/bankcard_service.py
-
-    # services/bankcard_service.py
-
     @staticmethod
     def bind_bankcard(
             user_id: int,
@@ -90,11 +88,11 @@ class BankcardService:
             account_name: str,
             bank_branch_id: Optional[str],
             bank_address_code: str,
-            is_default: bool,
-            admin_key: Optional[str],
-            ip_address: Optional[str]
+            is_default: bool = True,
+            admin_key: Optional[str] = None,
+            ip_address: Optional[str] = None
     ) -> Dict[str, Any]:
-        """绑定银行卡"""
+        """绑定银行卡（验证微信数据一致性）"""
         logger.info(f"【绑定开始】user_id={user_id}")
         try:
             sub_mchid, wechat_data = BankcardService._get_wechat_settlement_info_from_api(user_id)
@@ -111,7 +109,7 @@ class BankcardService:
 
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # 检查 merchant_settlement_accounts 表是否已存在相同的银行卡信息
+                    # 检查重复绑定
                     cur.execute(
                         """
                         SELECT id FROM merchant_settlement_accounts 
@@ -120,23 +118,10 @@ class BankcardService:
                         """,
                         (user_id, encrypted_number)
                     )
-                    existing_merchant_record = cur.fetchone()
+                    if cur.fetchone():
+                        raise Exception("F016: 已绑定相同的银行卡")
 
-                    # 检查 user_bankcards 表是否已存在相同的银行卡信息
-                    cur.execute(
-                        """
-                        SELECT id FROM user_bankcards 
-                        WHERE user_id = %s AND bank_account = %s
-                        LIMIT 1
-                        """,
-                        (user_id, bank_account)
-                    )
-                    existing_user_bankcard_record = cur.fetchone()
-
-                    if existing_merchant_record or existing_user_bankcard_record:
-                        raise Exception("F016: 已绑定相同的银行卡，无法重复绑定")
-
-                    # 如果没有重复，继续绑定流程
+                    # 获取现有记录
                     cur.execute(
                         "SELECT id FROM merchant_settlement_accounts WHERE user_id = %s AND status = 1 LIMIT 1",
                         (user_id,)
@@ -168,6 +153,7 @@ class BankcardService:
                             user_id, 'bind', existing_record['id'], old_data, new_data, admin_key, ip_address
                         )
                         account_id = existing_record['id']
+                        action = 'updated'
                     else:
                         # 插入新记录
                         cur.execute(
@@ -191,8 +177,9 @@ class BankcardService:
                             {'bank_name': bank_name, 'account_type': account_type},
                             admin_key, ip_address
                         )
+                        action = 'created'
 
-                    # 插入数据到 user_bankcards 表
+                    # 同步到user_bankcards表
                     cur.execute(
                         """
                         INSERT INTO user_bankcards (user_id, bank_name, bank_account)
@@ -204,9 +191,11 @@ class BankcardService:
                     conn.commit()
 
                     return {
-                        'msg': 'ok', 'account_id': account_id,
-                        'action': 'created' if not existing_record else 'updated',
-                        'verify_method': 'wechat_api', 'verify_status': 'success'
+                        'msg': 'ok',
+                        'account_id': account_id,
+                        'action': action,
+                        'verify_method': 'wechat_api',
+                        'verify_status': 'success'
                     }
         except pymysql.MySQLError as e:
             raise Exception(f"F006: 数据库操作失败 - {e}")
@@ -214,16 +203,142 @@ class BankcardService:
             raise
 
     @staticmethod
-    def _get_account_record(cursor, account_id: int) -> Optional[Dict]:
-        cursor.execute(
-            """
-            SELECT id, user_id, account_type, account_bank, bank_name, bank_branch_id,
-                   bank_address_code, verify_result, is_default, status
-            FROM merchant_settlement_accounts WHERE id = %s
-            """,
-            (account_id,)
-        )
-        return cursor.fetchone()
+    async def unbind_bankcard(user_id: int, account_id: int, pay_password: str) -> Dict[str, Any]:
+        """解绑银行卡"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 验证银行卡是否存在且属于该用户
+                cur.execute(
+                    """
+                    SELECT * FROM merchant_settlement_accounts 
+                    WHERE id = %s AND user_id = %s AND status = 1
+                    """,
+                    (account_id, user_id)
+                )
+                account = cur.fetchone()
+                if not account:
+                    raise HTTPException(status_code=404, detail="银行卡不存在")
+
+                # 2. 验证支付密码
+                if not BankcardService._verify_pay_password(user_id, pay_password):
+                    raise HTTPException(status_code=400, detail="支付密码错误")
+
+                # 3. 检查未完成订单
+                cur.execute(
+                    """
+                    SELECT COUNT(*) as count FROM orders 
+                    WHERE merchant_id = %s AND status IN ('pending_pay', 'pending_ship', 'pending_recv')
+                    """,
+                    (user_id,)
+                )
+                if cur.fetchone()['count'] > 0:
+                    raise HTTPException(status_code=400, detail="存在未完成订单，无法解绑")
+
+                # 4. 软删除
+                update_sql = build_dynamic_update(
+                    cur,
+                    "merchant_settlement_accounts",
+                    {
+                        "status": 0,
+                        "updated_at": datetime.now()
+                    },
+                    "id = %s"
+                )
+                cur.execute(update_sql, (account_id,))
+
+                # 5. 记录操作日志
+                BankcardService._log_operation(
+                    user_id, 'unbind', account_id, None,
+                    {'status': 'unbinded'}, 'SYSTEM', '127.0.0.1'
+                )
+                conn.commit()
+
+                return {"account_id": account_id, "status": "unbinded"}
+
+    @staticmethod
+    async def send_sms_code(user_id: int, account_number: str) -> Dict[str, Any]:
+        """发送短信验证码（模拟实现）"""
+        logger.info(f"【短信验证码】user_id={user_id}, 卡号={account_number[-4:]}")
+
+        # 生产环境应集成真实短信服务商
+        return {
+            "session_id": str(uuid.uuid4()),
+            "expired_in": 300,
+            "mock_code": "123456"  # Mock模式下的测试验证码
+        }
+
+    @staticmethod
+    def list_bankcards(user_id: int) -> List[Dict[str, Any]]:
+        """获取银行卡列表（脱敏）"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                select_sql = build_dynamic_select(
+                    cur,
+                    "merchant_settlement_accounts",
+                    where_clause="user_id = %s AND status = 1",
+                    select_fields=[
+                        "id",
+                        "account_bank",
+                        "bank_name",
+                        "account_type",
+                        "verify_result",
+                        "verify_fail_reason",
+                        "is_default",
+                        "bind_at"
+                    ]
+                )
+                cur.execute(select_sql, (user_id,))
+                accounts = cur.fetchall()
+
+                for account in accounts:
+                    account['account_number_tail'] = BankcardService._extract_last_4(
+                        BankcardService._decrypt_local_encrypted(
+                            account['account_number_encrypted']
+                        )
+                    )
+                    account.pop('account_number_encrypted', None)
+                    account.pop('account_name_encrypted', None)
+
+                return accounts
+
+    @staticmethod
+    def set_default_bankcard(user_id: int, account_id: int) -> Dict[str, Any]:
+        """设置默认银行卡"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 验证银行卡存在且属于用户
+                cur.execute(
+                    """
+                    SELECT id FROM merchant_settlement_accounts 
+                    WHERE id = %s AND user_id = %s AND status = 1
+                    """,
+                    (account_id, user_id)
+                )
+                if not cur.fetchone():
+                    raise HTTPException(status_code=404, detail="银行卡不存在")
+
+                # 2. 将所有设为非默认
+                cur.execute(
+                    "UPDATE merchant_settlement_accounts SET is_default = 0 WHERE user_id = %s",
+                    (user_id,)
+                )
+
+                # 3. 设置指定卡为默认
+                update_sql = build_dynamic_update(
+                    cur,
+                    "merchant_settlement_accounts",
+                    {
+                        "is_default": 1,
+                        "updated_at": datetime.now()
+                    },
+                    "id = %s"
+                )
+                cur.execute(update_sql, (account_id,))
+
+                conn.commit()
+                logger.info(f"用户 {user_id} 设置默认银行卡: {account_id}")
+
+                return {"account_id": account_id, "is_default": 1}
 
     @staticmethod
     def modify_bankcard(
@@ -231,156 +346,131 @@ class BankcardService:
             bank_branch_id: Optional[str], bank_address_code: Optional[str],
             admin_key: Optional[str], ip_address: Optional[str]
     ) -> Dict[str, Any]:
-        """改绑银行卡 - 增加重复信息校验"""
+        """申请改绑银行卡"""
         logger.info(f"【改绑申请开始】user_id={user_id}")
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    # 1. 获取当前有效记录
-                    cur.execute(
-                        """
-                        SELECT id, sub_mchid, account_type,
-                               account_number_encrypted, account_name_encrypted,
-                               account_bank, bank_name
-                        FROM merchant_settlement_accounts
-                        WHERE user_id=%s AND status=1
-                        ORDER BY id DESC LIMIT 1
-                        """,
-                        (user_id,)
-                    )
-                    old = cur.fetchone()
-                    if not old:
-                        raise Exception("F008: 未找到有效银行卡记录")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 获取当前有效记录
+                cur.execute(
+                    """
+                    SELECT id, sub_mchid, account_type,
+                           account_number_encrypted, account_name_encrypted,
+                           account_bank, bank_name, modify_application_no
+                    FROM merchant_settlement_accounts
+                    WHERE user_id=%s AND status=1
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (user_id,)
+                )
+                old = cur.fetchone()
+                if not old:
+                    raise Exception("F008: 未找到有效银行卡记录")
 
-                    # 2. 重复申请校验
-                    if old.get('modify_application_no'):
-                        raise Exception("F017: 已存在进行中的改绑申请")
+                if old.get('modify_application_no'):
+                    raise Exception("F017: 已存在进行中的改绑申请")
 
-                    # ✅ 新增：校验新卡信息是否与旧卡完全相同
-                    # 解密旧卡信息
-                    try:
-                        old_plain_number = BankcardService._decrypt_local_encrypted(
-                            old['account_number_encrypted']
-                        )
-                        old_plain_name = BankcardService._decrypt_local_encrypted(
-                            old['account_name_encrypted']
-                        )
+                # 2. 校验新卡是否与旧卡相同
+                try:
+                    old_plain_number = BankcardService._decrypt_local_encrypted(old['account_number_encrypted'])
+                    if old_plain_number == new_bank_account and old['account_bank'] == new_bank_name:
+                        raise Exception("F018: 新卡信息与当前绑定卡信息相同")
+                except Exception as e:
+                    if "F018" in str(e):
+                        raise
 
-                        # 核心字段比对（卡号、户名、开户行）
-                        if (old_plain_number == new_bank_account and
-                                old_plain_name == new_account_name and
-                                old['account_bank'] == new_bank_name):
-                            raise Exception("F018: 新卡信息与当前绑定卡信息相同，无需改绑")
-                    except Exception as e:
-                        if "F018" in str(e):
-                            raise
-                        # 解密失败不影响主流程，继续执行让微信接口去校验
-                        logger.warning(f"解密旧卡信息失败: {e}")
+                # 3. 加密新卡信息
+                new_number_enc = BankcardService._encrypt_sensitive(new_bank_account)
+                new_name_enc = BankcardService._encrypt_sensitive(new_account_name)
 
-                    # ... 后续代码保持不变 ...
-                    # 3. 加密新卡信息
-                    new_number_enc = BankcardService._encrypt_sensitive(new_bank_account)
-                    new_name_enc = BankcardService._encrypt_sensitive(new_account_name)
+                # 4. 备份旧卡信息
+                old_backup = {
+                    "account_number_encrypted": old["account_number_encrypted"],
+                    "account_name_encrypted": old["account_name_encrypted"],
+                    "account_bank": old["account_bank"],
+                    "bank_name": old["bank_name"],
+                }
 
-                    # 4. 备份旧卡信息
-                    old_backup = {
-                        "account_number_encrypted": old["account_number_encrypted"],
-                        "account_name_encrypted": old["account_name_encrypted"],
-                        "account_bank": old["account_bank"],
-                        "bank_name": old["bank_name"],
+                # 5. 调用微信接口
+                sub_mchid = old["sub_mchid"]
+                wx_resp = wxpay_client.modify_settlement_account(
+                    sub_mchid,
+                    {
+                        "account_type": old["account_type"],
+                        "account_bank": new_bank_name[:128],
+                        "bank_name": new_bank_name[:128],
+                        "bank_branch_id": bank_branch_id or "",
+                        "bank_address_code": bank_address_code or "",
+                        "account_number": new_bank_account,
+                        "account_name": new_account_name,
                     }
+                )
+                application_no = wx_resp.get("application_no")
+                if not application_no:
+                    raise Exception("F009: 微信接口未返回申请单号")
 
-                    # 5. 调用微信接口提交改绑
-                    sub_mchid = old["sub_mchid"]
-                    wx_resp = wxpay_client.modify_settlement_account(
-                        sub_mchid,
-                        {
-                            "account_type": old["account_type"],
-                            "account_bank": new_bank_name[:128],
-                            "bank_name": new_bank_name[:128],
-                            "bank_branch_id": bank_branch_id or "",
-                            "bank_address_code": bank_address_code or "",
-                            "account_number": new_bank_account,
-                            "account_name": new_account_name,
+                # 6. 更新数据库
+                cur.execute(
+                    """
+                    UPDATE merchant_settlement_accounts
+                    SET new_account_number_encrypted=%s,
+                        new_account_name_encrypted=%s,
+                        new_bank_name=%s,
+                        old_account_backup=%s,
+                        modify_application_no=%s,
+                        verify_result='VERIFYING',
+                        updated_at=NOW()
+                    WHERE id=%s
+                    """,
+                    (
+                        new_number_enc,
+                        new_name_enc,
+                        new_bank_name,
+                        json.dumps(old_backup, ensure_ascii=False),
+                        application_no,
+                        old["id"]
+                    )
+                )
+                conn.commit()
+
+                # 7. 记录日志
+                BankcardService._log_operation(
+                    user_id, 'modify_apply', old["id"], None,
+                    {
+                        "application_no": application_no,
+                        "new_account": {
+                            "bank_name": new_bank_name,
+                            "bank_account": new_bank_account,
+                            "account_name": new_account_name
                         }
-                    )
-                    application_no = wx_resp.get("application_no")
-                    if not application_no:
-                        raise Exception("F009: 微信接口未返回申请单号")
+                    },
+                    admin_key, ip_address
+                )
 
-                    # 6. 写库：保存新卡+备份旧卡+申请号
-                    cur.execute(
-                        """
-                        UPDATE merchant_settlement_accounts
-                        SET new_account_number_encrypted=%s,
-                            new_account_name_encrypted=%s,
-                            new_bank_name=%s,
-                            old_account_backup=%s,
-                            modify_application_no=%s,
-                            verify_result='VERIFYING',
-                            updated_at=NOW()
-                        WHERE id=%s
-                        """,
-                        (
-                            new_number_enc,
-                            new_name_enc,
-                            new_bank_name,
-                            json.dumps(old_backup, ensure_ascii=False),
-                            application_no,
-                            old["id"]
-                        )
-                    )
-                    conn.commit()
-
-                    # 7. 记录审计日志
-                    BankcardService._log_operation(
-                        user_id,
-                        "modify_apply",
-                        old["id"],
-                        None,
-                        {
-                            "application_no": application_no,
-                            "new_account": {
-                                "bank_name": new_bank_name,
-                                "bank_account": new_bank_account,
-                                "account_name": new_account_name
-                            }
-                        },
-                        admin_key,
-                        ip_address
-                    )
-
-            return {"msg": "ok", "application_no": application_no, "status": "pending_review"}
-        except pymysql.MySQLError as e:
-            raise Exception(f"F006: 数据库操作失败 - {e}")
-        except Exception as e:
-            raise
+                return {"msg": "ok", "application_no": application_no, "status": "pending_review"}
 
     @staticmethod
     def poll_modify_status(user_id: int, application_no: str) -> Dict[str, Any]:
-        """查询改绑审核状态 - 审核通过后同步更新两张表"""
+        """轮询改绑审核状态"""
         logger.info(f"【轮询改绑状态】user_id={user_id}, application_no={application_no}")
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    # 1. 查询改绑记录（含新卡临时字段）
-                    cur.execute(
-                        """
-                        SELECT id, sub_mchid,
-                               new_bank_name,
-                               new_account_name_encrypted, new_account_number_encrypted,
-                               old_account_backup
-                        FROM merchant_settlement_accounts
-                        WHERE user_id=%s AND modify_application_no=%s
-                        LIMIT 1
-                        """,
-                        (user_id, application_no)
-                    )
-                    record = cur.fetchone()
-                    if not record:
-                        raise Exception("F013: 未找到改绑申请记录")
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, sub_mchid,
+                           new_bank_name,
+                           new_account_name_encrypted, new_account_number_encrypted,
+                           old_account_backup
+                    FROM merchant_settlement_accounts
+                    WHERE user_id=%s AND modify_application_no=%s
+                    LIMIT 1
+                    """,
+                    (user_id, application_no)
+                )
+                record = cur.fetchone()
+                if not record:
+                    raise Exception("F013: 未找到改绑申请记录")
 
-            # 2. 查询微信审核状态
+            # 查询微信状态
             sub_mchid = record["sub_mchid"]
             wx_resp = wxpay_client.query_application_status(sub_mchid, application_no)
 
@@ -391,17 +481,13 @@ class BankcardService:
                 'APPLYMENT_STATE_CANCELED': 'VERIFY_FAIL',
                 'APPLYMENT_STATE_FINISHED': 'VERIFY_SUCCESS'
             }
-            new_status = status_map.get(
-                wx_resp.get('applyment_state', 'APPLYMENT_STATE_REJECTED'),
-                'VERIFY_FAIL'
-            )
+            new_status = status_map.get(wx_resp.get('applyment_state'), 'VERIFY_FAIL')
             fail_reason = wx_resp.get('applyment_state_msg', '')
 
-            # 3. 根据审核结果更新数据库
+            # 更新数据库
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     if new_status == 'VERIFY_SUCCESS':
-                        # 审核通过：用新卡信息覆盖正式字段
                         cur.execute(
                             """
                             UPDATE merchant_settlement_accounts
@@ -428,7 +514,7 @@ class BankcardService:
                             )
                         )
 
-                        # 同步更新 user_bankcards（解密获取明文尾号）
+                        # 同步更新user_bankcards
                         new_plain_number = BankcardService._decrypt_local_encrypted(
                             record["new_account_number_encrypted"]
                         )
@@ -441,7 +527,6 @@ class BankcardService:
                             (record["new_bank_name"], new_plain_number, user_id)
                         )
                     else:
-                        # 审核失败：清掉临时字段，保留旧卡信息
                         cur.execute(
                             """
                             UPDATE merchant_settlement_accounts
@@ -458,7 +543,6 @@ class BankcardService:
                             (new_status, fail_reason, record["id"])
                         )
 
-                    # 记录审计日志
                     BankcardService._log_operation(
                         user_id,
                         "modify_success" if new_status == "VERIFY_SUCCESS" else "modify_fail",
@@ -477,18 +561,16 @@ class BankcardService:
                 "detail": fail_reason,
                 "is_completed": new_status in ["VERIFY_SUCCESS", "VERIFY_FAIL"]
             }
-        except pymysql.MySQLError as e:
-            raise Exception(f"F006: 数据库操作失败 - {e}")
-        except Exception as e:
-            raise
 
     @staticmethod
     def query_bind_status(user_id: int) -> Dict[str, Any]:
         """查询绑定状态"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT sub_mchid FROM wx_applyment WHERE user_id = %s ORDER BY id DESC LIMIT 1",
-                            (user_id,))
+                cur.execute(
+                    "SELECT sub_mchid FROM wx_applyment WHERE user_id = %s ORDER BY id DESC LIMIT 1",
+                    (user_id,)
+                )
                 sub_mchid_record = cur.fetchone()
                 if not sub_mchid_record:
                     return {'is_bound': False, 'reason': '未找到微信进件记录'}
@@ -496,7 +578,11 @@ class BankcardService:
                 sub_mchid = sub_mchid_record['sub_mchid']
 
                 cur.execute(
-                    "SELECT id, status, verify_result, bind_at FROM merchant_settlement_accounts WHERE user_id = %s AND status = 1 LIMIT 1",
+                    """
+                    SELECT id, status, verify_result, bind_at 
+                    FROM merchant_settlement_accounts 
+                    WHERE user_id = %s AND status = 1 LIMIT 1
+                    """,
                     (user_id,)
                 )
                 local_record = cur.fetchone()
@@ -520,7 +606,7 @@ class BankcardService:
 
     @staticmethod
     def get_operation_logs(user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
-        """获取操作日志"""
+        """获取操作日志列表"""
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -548,13 +634,10 @@ class BankcardService:
 
     @staticmethod
     def query_my_bankcard(user_id: int) -> Dict[str, Any]:
-        """
-        【核心修复版】仅返回验证成功的银行卡
-        """
+        """查询我的银行卡（仅返回验证成功的卡）"""
         logger.info(f"【查询我的银行卡】user_id={user_id}")
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # ✅ 核心修复：添加 verify_result='VERIFY_SUCCESS' 过滤
                 cur.execute(
                     """
                     SELECT id, account_bank, account_number_encrypted, account_name_encrypted,
@@ -597,6 +680,19 @@ class BankcardService:
                     logger.error(f"解密失败: {e}")
                     return {"has_bankcard": True, "account_id": record['id'], "error": "F015: 解密失败"}
 
+    # ==================== 内部工具方法 ====================
+    @staticmethod
+    def _get_account_record(cursor, account_id: int) -> Optional[Dict]:
+        cursor.execute(
+            """
+            SELECT id, user_id, account_type, account_bank, bank_name, bank_branch_id,
+                   bank_address_code, verify_result, is_default, status
+            FROM merchant_settlement_accounts WHERE id = %s
+            """,
+            (account_id,)
+        )
+        return cursor.fetchone()
+
     @staticmethod
     def _log_operation(
             user_id: int, operation_type: str, target_id: Optional[int],
@@ -626,27 +722,27 @@ class BankcardService:
 
     @staticmethod
     def _encrypt_sensitive(plaintext: str) -> str:
-        """本地加密"""
+        """本地AES-GCM加密"""
         key = wxpay_client.apiv3_key[:32]
-        iv = os.urandom(12)
-        aesgcm = AESGCM(key)
-        ciphertext = aesgcm.encrypt(iv, plaintext.encode('utf-8'), b'')
-        return base64.b64encode(iv + ciphertext).decode('utf-8')
+        return wxpay_client._encrypt_local(plaintext, key)
 
     @staticmethod
     def _decrypt_local_encrypted(encrypted_data: str) -> str:
-        """本地解密"""
-        key = wxpay_client.apiv3_key
-        combined = base64.b64decode(encrypted_data)
-        iv, ciphertext = combined[:12], combined[12:]
-        aesgcm = AESGCM(key)
-        return aesgcm.decrypt(iv, ciphertext, b'').decode('utf-8')
+        """本地AES-GCM解密"""
+        key = wxpay_client.apiv3_key[:32]
+        return wxpay_client._decrypt_local(encrypted_data, key)
+
+    @staticmethod
+    def _verify_pay_password(user_id: int, pay_password: str) -> bool:
+        """验证支付密码（模拟实现）"""
+        # 生产环境应查询users表的pay_password_hash字段并验证
+        return pay_password == "123456"  # Mock模式
 
     @staticmethod
     def _map_account_type(wechat_account_type: str) -> str:
-        """将微信API返回的账户类型映射到数据库支持的值"""
+        """映射微信账户类型到数据库值"""
         mapping = {
             'ACCOUNT_TYPE_PRIVATE': 'BANK_ACCOUNT_TYPE_PERSONAL',
             'ACCOUNT_TYPE_BUSINESS': 'BANK_ACCOUNT_TYPE_CORPORATE'
         }
-        return mapping.get(wechat_account_type, 'BANK_ACCOUNT_TYPE_PERSONAL')  # 默认值
+        return mapping.get(wechat_account_type, 'BANK_ACCOUNT_TYPE_PERSONAL')
