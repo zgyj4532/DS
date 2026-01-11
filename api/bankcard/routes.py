@@ -64,26 +64,26 @@ async def bind_bankcard(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/unbind", summary="解绑银行卡")
-async def unbind_bankcard(
-    account_id: int = Form(..., description="银行卡ID"),
-    pay_password: str = Form(..., description="支付密码"),
-    current_user: dict = Depends(get_current_user)
-):
-    """解绑银行卡（需验证支付密码）"""
-    try:
-        result = await BankcardService.unbind_bankcard(
-            user_id=current_user["id"],
-            account_id=account_id,
-            pay_password=pay_password
-        )
-        return {"code": 0, "message": "解绑成功", "data": result}
-    except Exception as e:
-        logger.error(f"解绑失败: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+# @router.post("/unbind", summary="解绑银行卡")
+# async def unbind_bankcard(
+#     account_id: int = Form(..., description="银行卡ID"),
+#     pay_password: str = Form(..., description="支付密码"),
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     """解绑银行卡（需验证支付密码）"""
+#     try:
+#         result = await BankcardService.unbind_bankcard(
+#             user_id=current_user["id"],
+#             account_id=account_id,
+#             pay_password=pay_password
+#         )
+#         return {"code": 0, "message": "解绑成功", "data": result}
+#     except Exception as e:
+#         logger.error(f"解绑失败: {e}")
+#         raise HTTPException(status_code=400, detail=str(e))
+#
 
-
-@router.post("/sms/send", summary="发送短信验证码")
+@router.post("/sms/send", summary="发送短信验证码（暂不支持）")
 async def send_sms_code(
     account_number: str = Form(..., description="银行卡号"),
     current_user: dict = Depends(get_current_user)

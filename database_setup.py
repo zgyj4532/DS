@@ -568,6 +568,7 @@ class DatabaseManager:
                     bank_address_code VARCHAR(20) NOT NULL COMMENT '开户银行地区码（6位数字码）',
                     account_name_encrypted TEXT NOT NULL COMMENT '开户名称（加密，RSA+Base64）',
                     account_number_encrypted TEXT NOT NULL COMMENT '银行账号（加密，RSA+Base64）',
+                    card_hash VARCHAR(64) NULL COMMENT '卡号哈希（用于判重，加盐SHA256）',
                     verify_result ENUM('VERIFY_SUCCESS','VERIFY_FAIL','VERIFYING')
                         NOT NULL DEFAULT 'VERIFYING' COMMENT '验证结果',
                     verify_fail_reason VARCHAR(1024) NULL COMMENT '验证失败原因',
@@ -587,6 +588,7 @@ class DatabaseManager:
                     INDEX idx_sub_mchid (sub_mchid),
                     INDEX idx_verify_result (verify_result),
                     INDEX idx_status (status)
+                    UNIQUE KEY uk_card_hash (card_hash)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'merchant_realname_verification': """
