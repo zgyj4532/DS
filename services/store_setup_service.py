@@ -33,13 +33,15 @@ class StoreSetupService:
                 return cur.fetchone() is not None
 
     def _check_permission(self, user_id: int) -> bool:
-        """检查是否有开店权限（支付进件成功）"""
+        """检查是否有开店权限（改为is_merchant判断）"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                sql = build_dynamic_select(cur, "users", where_clause="id=%s", select_fields=["has_store_permission"])
-                cur.execute(sql, (user_id,))
+                cur.execute(
+                    "SELECT is_merchant FROM users WHERE id=%s",
+                    (user_id,)
+                )
                 result = cur.fetchone()
-                return result and result['has_store_permission'] == 1
+                return result and result['is_merchant'] == 1
 
     def create_store_info(self, req: StoreInfoCreateReq) -> Dict[str, Any]:
         """创建店铺信息（支付进件成功后调用）"""
@@ -179,12 +181,12 @@ class StoreSetupService:
                 return store
 
     def get_setup_status(self, user_id: int) -> Dict[str, Any]:
-        """获取店铺设置状态（支付进件和店铺信息）"""
+        """获取店铺设置状态（仅依赖is_merchant）"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 检查支付进件状态（has_store_permission）
+                # 检查用户是否存在
                 cur.execute(
-                    "SELECT has_store_permission, is_merchant FROM users WHERE id=%s",
+                    "SELECT id, is_merchant FROM users WHERE id=%s",
                     (user_id,)
                 )
                 user = cur.fetchone()
@@ -192,9 +194,9 @@ class StoreSetupService:
                 if not user:
                     raise FinanceException(f"用户不存在: user_id={user_id}")
 
-                has_store_permission = user['has_store_permission'] == 1
-                has_payment_account = has_store_permission
                 is_merchant = user['is_merchant'] == 1
+                has_store_permission = is_merchant  # 保持字段名兼容前端
+                has_payment_account = is_merchant  # 保持字段名兼容前端
 
                 # 检查是否已设置店铺信息
                 cur.execute(
@@ -204,12 +206,13 @@ class StoreSetupService:
                 store = cur.fetchone()
 
                 has_store_info = store is not None
-                can_setup_store = has_store_permission and not has_store_info
+                # 只要有merchant权限且未创建店铺，就可以创建
+                can_setup_store = is_merchant and not has_store_info
 
                 return {
                     "user_id": user_id,
-                    "has_store_permission": has_store_permission,
-                    "has_payment_account": has_payment_account,
+                    "has_store_permission": has_store_permission,  # 前端兼容
+                    "has_payment_account": has_payment_account,  # 前端兼容
                     "has_store_info": has_store_info,
                     "can_setup_store": can_setup_store,
                     "store_info": self.get_store_info(user_id) if has_store_info else None
