@@ -956,13 +956,16 @@ def get_banners(product_id: Optional[int] = Query(None, description="商品ID，
 def get_sales_data(id: int):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # ✅ 修改：只统计已支付或已完成的订单
+            # ✅ 优化：统计所有有效订单（已支付/已发货/已完成），排除已成功退款的订单
             cur.execute("""
-                SELECT SUM(oi.quantity) AS qty, SUM(oi.total_price) AS sales 
+                SELECT 
+                    SUM(oi.quantity) AS qty, 
+                    SUM(oi.total_price) AS sales 
                 FROM order_items oi
                 INNER JOIN orders o ON oi.order_id = o.id
                 WHERE oi.product_id = %s 
                 AND o.status IN ('pending_ship', 'pending_recv', 'completed')
+                AND COALESCE(o.refund_status, '') != 'refund_success'
             """, (id,))
 
             row = cur.fetchone()

@@ -69,7 +69,8 @@ app = FastAPI(
 # 注册全局异常处理器（放在 core/json_response.py 中实现）
 register_exception_handlers(app)
 
-# 定义 OpenAPI Tags 元数据，用于在 Swagger UI 中更好地组织接口
+# ... 原有代码保持不变 ...
+
 tags_metadata = [
     {
         "name": "财务系统",
@@ -90,7 +91,8 @@ tags_metadata = [
     {
         "name": "系统配置",
         "description": "系统配置相关接口，包括系统标语、轮播图标语等配置管理。",
-    }, {
+    },
+    {
         "name": "店铺设置",
         "description": "店铺设置相关接口，包括店铺信息创建、更新、查询、LOGO上传、设置状态查询等功能。",
     },
@@ -98,7 +100,12 @@ tags_metadata = [
         "name": "微信进件",
         "description": "微信支付进件相关接口，包括实名认证、进件申请、材料上传、状态查询等功能。",
     },
-    # 新增标签：
+    # ==================== ✅ 新增：微信支付标签 ====================
+    {
+        "name": "微信支付",
+        "description": "微信支付相关接口，包括支付回调、订单查询等功能。",
+    },
+    # ============================================================
     {
         "name": "银行卡管理",
         "description": "银行卡绑定、解绑、改绑、状态查询等独立功能模块。",
@@ -108,6 +115,8 @@ tags_metadata = [
         "description": "支付单创建,收款码生成,用户支付，后续管理等功能。",
     },
 ]
+
+# ... 后续代码保持不变 ...
 
 # 更新 OpenAPI Schema 的 tags 元数据
 app.openapi_tags = tags_metadata

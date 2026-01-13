@@ -15,6 +15,7 @@ logs/
 # Virtual environments
 .venv
 .env
+certs
 pic_data/
 user_pic/
 uploads/
