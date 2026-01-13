@@ -5,6 +5,7 @@ import datetime
 from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
+    UpdateAddressReq,
     PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
     UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse,SetUnilevelReq
 )
@@ -785,6 +786,34 @@ def address_add(body: AddressReq):
                 )
             conn.commit()
             return {"addr_id": addr_id}
+
+
+@router.put("/address/{addr_id}", summary="更新地址（部分字段可选）")
+def address_update(addr_id: int, body: UpdateAddressReq):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1. 验证用户存在并获取 user_id
+            select_sql = build_dynamic_select(cur, "users", where_clause="mobile=%s", select_fields=["id"])
+            cur.execute(select_sql, (body.mobile,))
+            u = cur.fetchone()
+            if not u:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            user_id = u["id"]
+
+            # 2. 准备更新字段（只包含非 None 的字段，且不包含 mobile）
+            data = body.model_dump(exclude_none=True)
+            data.pop("mobile", None)
+            if not data:
+                raise HTTPException(status_code=400, detail="无更新内容")
+
+            # 3. 调用服务方法执行更新（AddressService 会做列名校验）
+            try:
+                AddressService.update_address(user_id, addr_id, **data)
+                conn.commit()
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+    return {"msg": "ok"}
 @router.put("/address/default", summary="设为默认地址")
 def set_default_addr(addr_id: int, mobile: str):
     with get_conn() as conn:

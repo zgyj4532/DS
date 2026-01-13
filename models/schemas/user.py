@@ -51,6 +51,20 @@ class AddressReq(BaseModel):
     model_config = ConfigDict(validate_by_name=True)  # Pydantic V2: 同时支持 name / consignee_name
 
 
+class UpdateAddressReq(BaseModel):
+    mobile: str
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    province: Optional[str] = None
+    city: Optional[str] = None
+    district: Optional[str] = None
+    detail: Optional[str] = None
+    is_default: Optional[bool] = None
+    addr_type: Optional[str] = None
+
+    model_config = ConfigDict(validate_by_name=True)
+
+
 class PointsReq(BaseModel):
     """积分请求"""
     mobile: str
