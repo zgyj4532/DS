@@ -511,16 +511,23 @@ class WechatApplymentService:
 
     def _validate_media(self, cur, user_id: int, applyment_id: int):
         """验证材料完整性"""
-        # ✅ 修复：同时检查 NULL 和 0
         cur.execute("""
             SELECT media_type FROM wx_applyment_media 
             WHERE user_id = %s AND (applyment_id = %s OR applyment_id IS NULL OR applyment_id = 0)
         """, (user_id, applyment_id))
         uploaded = {row['media_type'] for row in cur.fetchall()}
 
-        required = {'id_card_front', 'id_card_back', 'business_license'}
+        # ✅ 修复：根据主体类型判断所需材料
+        cur.execute("SELECT subject_type FROM wx_applyment WHERE id = %s", (applyment_id,))
+        subject_type = cur.fetchone()['subject_type']
+
+        # 动态设置必需材料
+        required = {'id_card_front', 'id_card_back'}
+        if subject_type == 'SUBJECT_TYPE_ENTERPRISE':
+            required.add('business_license')  # 企业才需要营业执照
+
         if not required.issubset(uploaded):
-            raise HTTPException(status_code=400, detail="缺少必要的材料")
+            raise HTTPException(status_code=400, detail=f"缺少必要的材料: {required - uploaded}")
 
     def _check_reject_issues_fixed(self, cur, applyment_id: int) -> bool:
         """检查驳回问题是否已修复"""

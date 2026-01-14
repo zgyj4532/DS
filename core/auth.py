@@ -376,6 +376,7 @@ def create_access_token(user_id: int, token_type: str = "uuid") -> str:
     else:
         return _create_uuid_token(user_id)
 
+
 def _create_uuid_token(user_id: int) -> str:
     """创建 UUID Token（开发环境）"""
     token = str(uuid.uuid4())
@@ -383,8 +384,29 @@ def _create_uuid_token(user_id: int) -> str:
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # ... 保留原有逻辑 ...
-                pass
+                # 检查 sessions 表是否存在
+                cur.execute("SHOW TABLES LIKE 'sessions'")
+                has_sessions = cur.fetchone() is not None
+
+                if has_sessions:
+                    # 使用 sessions 表（推荐方式）
+                    sql = """
+                        INSERT INTO sessions (user_id, token, created_at, expired_at)
+                        VALUES (%s, %s, NOW(), DATE_ADD(NOW(), INTERVAL 7 DAY))
+                        ON DUPLICATE KEY UPDATE 
+                            token = VALUES(token), 
+                            expired_at = VALUES(expired_at)
+                    """
+                    cur.execute(sql, (user_id, token))
+                else:
+                    # 回退到 users.token 字段
+                    cur.execute("UPDATE users SET token = %s WHERE id = %s", (token, user_id))
+
+                conn.commit()
+
+        logger.info(f"创建 UUID Token 成功 - 用户ID: {user_id}, Token: {token[:8]}...")
+        return token
+
     except Exception as e:
         logger.error(f"创建 UUID Token 失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="创建认证令牌失败")
