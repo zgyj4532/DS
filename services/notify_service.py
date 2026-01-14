@@ -1,4 +1,4 @@
-# notify_service.py
+# services/notify_service.py
 import httpx
 from decimal import Decimal
 from datetime import datetime
@@ -11,20 +11,30 @@ logger = get_logger(__name__)
 
 # ----------- 全局 wxpay 实例 ----------
 if not settings.WX_MOCK_MODE:
-    from wechatpayv3 import WeChatPay, WeChatPayType  # ✅ 导入移到内部
+    from wechatpayv3 import WeChatPay, WeChatPayType
+
+    # 加载商户私钥（字符串）
     _private_key = Path(settings.WECHAT_PAY_API_KEY_PATH).read_text(encoding="utf-8")
+
+    # 加载微信支付平台公钥（字符串，不是对象！）
+    public_key_str = None
+    if settings.WECHAT_PAY_PUBLIC_KEY_PATH and Path(settings.WECHAT_PAY_PUBLIC_KEY_PATH).exists():
+        public_key_str = Path(settings.WECHAT_PAY_PUBLIC_KEY_PATH).read_text(encoding="utf-8")
+
+    # 初始化微信支付客户端
     wxpay = WeChatPay(
         wechatpay_type=WeChatPayType.MINIPROG,
         mchid=settings.WECHAT_PAY_MCH_ID,
         private_key=_private_key,
         cert_serial_no=settings.WECHAT_CERT_SERIAL_NO,
-        api_v3_key=settings.WECHAT_PAY_API_V3_KEY,
+        apiv3_key=settings.WECHAT_PAY_API_V3_KEY,
         appid=settings.WECHAT_APP_ID,
-        user_agent="github.com/wechatpay-apiv3/wechatpay-python"
+        public_key=public_key_str,  # 传入字符串，不是对象
+        public_key_id=settings.WECHAT_PAY_PUB_KEY_ID,
+        # user_agent="github.com/wechatpay-apiv3/wechatpay-python"
     )
 else:
     wxpay = None
-
 
 # 2. 给用户微信“零钱到账”通知
 async def _transfer_to_user(openid: str, amount: Decimal, desc: str) -> str:

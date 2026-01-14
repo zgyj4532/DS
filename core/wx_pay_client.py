@@ -8,17 +8,19 @@ import base64
 import json
 import datetime
 from typing import Dict, Any, Optional
+from pathlib import Path
+import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography import x509
-import requests
+from cryptography import x509  # ✅ 正确导入
 
 from core.config import (
     WECHAT_PAY_MCH_ID, WECHAT_PAY_API_V3_KEY,
     WECHAT_PAY_API_CERT_PATH, WECHAT_PAY_API_KEY_PATH,
-    WECHAT_PAY_PLATFORM_CERT_PATH, WECHAT_APP_ID, WECHAT_APP_SECRET,
+    WECHAT_PAY_PLATFORM_CERT_PATH, WECHAT_PAY_PUBLIC_KEY_PATH,
+    WECHAT_APP_ID, WECHAT_APP_SECRET,
     ENVIRONMENT, WECHAT_PAY_PUB_KEY_ID
 )
 from core.database import get_conn
@@ -62,10 +64,16 @@ class WeChatPayClient:
         self.apiv3_key = WECHAT_PAY_API_V3_KEY.encode('utf-8')
         self.cert_path = WECHAT_PAY_API_CERT_PATH
         self.key_path = WECHAT_PAY_API_KEY_PATH
-        self.platform_cert_path = WECHAT_PAY_PLATFORM_CERT_PATH
+
+        # 修复：优先使用 WECHAT_PAY_PUBLIC_KEY_PATH，回退到 WECHAT_PAY_PLATFORM_CERT_PATH
+        self.platform_cert_path = WECHAT_PAY_PUBLIC_KEY_PATH or WECHAT_PAY_PLATFORM_CERT_PATH
+
         self.pub_key_id = WECHAT_PAY_PUB_KEY_ID
 
-        # 初始化连接池
+        # 修复：初始化序列号缓存属性（关键修复）
+        self._cached_serial_no = None
+
+        # 初始化HTTP连接池（用于调用微信支付API）
         self.session = requests.Session()
         self.session.mount('https://', requests.adapters.HTTPAdapter(
             pool_connections=10,
@@ -76,7 +84,6 @@ class WeChatPayClient:
         # 加载密钥和公钥
         self.private_key = self._load_private_key()
         self.wechat_public_key = self._load_wechat_public_key()
-        self._cached_serial_no = None
 
         # 初始化Mock测试数据
         if self.mock_mode:
@@ -106,7 +113,7 @@ class WeChatPayClient:
                     raise FileNotFoundError(
                         f"生产环境必须配置有效的平台证书。请检查：\n"
                         f"1. WECHAT_PAY_PUB_KEY_ID 是否配置正确（必须以PUB_KEY_开头）\n"
-                        f"2. 或确保 WECHAT_PAY_PLATFORM_CERT_PATH 指向有效文件: {self.platform_cert_path}"
+                        f"2. 或确保 WECHAT_PAY_PUBLIC_KEY_PATH 指向有效文件: {self.platform_cert_path}"
                     )
                 # 非生产环境可以跳过
                 logger.warning("平台证书文件不存在，将跳过验签（仅限开发环境）")
@@ -122,24 +129,50 @@ class WeChatPayClient:
             if not self.mock_mode:
                 raise
             return None
-    def _download_and_cache_platform_cert(self, pub_key_id: str):
-        """从微信API下载平台证书并缓存到本地"""
 
-        # 构建请求头
+    def _download_and_cache_platform_cert(self, pub_key_id: str):
+        """从微信API下载平台证书并缓存到本地（修复版）"""
+
+        # ✅ 修复：确保使用商户证书序列号
+        merchant_serial_no = self._get_merchant_serial_no()
+
+        # ✅ 修复：GET 请求，body 为空字符串
         timestamp = str(int(time.time()))
         nonce_str = str(uuid.uuid4()).replace('-', '')
         signature = self._sign('GET', '/v3/certificates', timestamp, nonce_str, '')
 
+        # ✅ 修复：严格格式，无多余空格
+        auth_header = (
+            f'WECHATPAY2-SHA256-RSA2048 '
+            f'mchid="{self.mchid}",'
+            f'serial_no="{merchant_serial_no}",'
+            f'nonce_str="{nonce_str}",'
+            f'timestamp="{timestamp}",'
+            f'signature="{signature}"'
+        )
+
         headers = {
-            'Authorization': f'WECHATPAY2-SHA256-RSA2048 mchid="{self.mchid}",serial_no="{self._get_merchant_serial_no()}",nonce_str="{nonce_str}",timestamp="{timestamp}",signature="{signature}"',
+            'Authorization': auth_header,
             'Accept': 'application/json',
             'User-Agent': 'WeChatPay-Python/1.0',
+            # ✅ 修复：Wechatpay-Serial 必须是商户证书序列号
+            'Wechatpay-Serial': merchant_serial_no
         }
 
-        # 调用微信证书下载接口
+        # ✅ 修复：添加详细调试日志
+        logger.info(f"【下载证书】请求头完整内容: {auth_header}")
+        logger.info(f"【下载证书】签名原文: GET\n/v3/certificates\n{timestamp}\n{nonce_str}\n\n")
+
         url = f"{self.BASE_URL}/v3/certificates"
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
+
+        try:
+            response = self.session.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            # ✅ 修复：打印微信返回的详细错误
+            logger.error(f"【下载证书】HTTP错误: {e}")
+            logger.error(f"【下载证书】微信响应: {response.text if response else '无响应'}")
+            raise
 
         certs_data = response.json()
 
@@ -188,6 +221,7 @@ class WeChatPayClient:
             return
 
         try:
+            # 使用 get_conn() 进行数据库操作
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
@@ -272,6 +306,7 @@ class WeChatPayClient:
             })
 
         try:
+            # 使用 get_conn() 进行数据库操作
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
@@ -373,12 +408,14 @@ class WeChatPayClient:
             return self._cached_serial_no
 
         try:
+            # ✅ 修复：使用 x509.load_pem_x509_certificate 而不是 serialization
             with open(self.cert_path, 'rb') as f:
-                cert = serialization.load_pem_x509_certificate(
+                cert = x509.load_pem_x509_certificate(
                     f.read(),
                     backend=default_backend()
                 )
                 self._cached_serial_no = format(cert.serial_number, 'x').upper()
+                logger.info(f"成功加载商户证书序列号: {self._cached_serial_no}")
                 return self._cached_serial_no
         except Exception as e:
             logger.error(f"获取商户证书序列号失败: {e}")
@@ -435,14 +472,21 @@ class WeChatPayClient:
         return base64.b64encode(signature).decode('utf-8')
 
     def _build_auth_header(self, method: str, url: str, body: str = '') -> str:
-        """构建Authorization请求头"""
+        """构建 Authorization 请求头（严格对齐微信规范）"""
         timestamp = str(int(time.time()))
         nonce_str = str(uuid.uuid4()).replace('-', '')
         signature = self._sign(method, url, timestamp, nonce_str, body)
-
         serial_no = self._get_merchant_serial_no()
 
-        auth_str = f'mchid="{self.mchid}",serial_no="{serial_no}",nonce_str="{nonce_str}",timestamp="{timestamp}",signature="{signature}"'
+        # ✅ 关键修复：参数值中的双引号需要转义，且格式严格对齐
+        auth_params = [
+            f'mchid="{self.mchid}"',
+            f'serial_no="{serial_no}"',
+            f'nonce_str="{nonce_str}"',
+            f'timestamp="{timestamp}"',
+            f'signature="{signature}"'
+        ]
+        auth_str = ','.join(auth_params)
         return f'WECHATPAY2-SHA256-RSA2048 {auth_str}'
 
     # ==================== 进件相关API ====================

@@ -769,17 +769,16 @@ class DatabaseManager:
         self._add_user_bankcard_operations_foreign_keys(cursor)
 
         try:
-            cursor.execute("""
-                CREATE UNIQUE INDEX uk_card_hash_active 
-                ON merchant_settlement_accounts (card_hash) 
-                WHERE status = 1
-            """)
-            logger.info("✅ 已创建条件唯一索引 uk_card_hash_active（防重复绑卡）")
+            # 创建普通索引（提升查询性能）
+            cursor.execute("CREATE INDEX idx_card_hash ON merchant_settlement_accounts (card_hash)")
+            cursor.execute("CREATE INDEX idx_status ON merchant_settlement_accounts (status)")
+            cursor.execute("CREATE INDEX idx_user_status ON merchant_settlement_accounts (user_id, status)")
+            logger.info("✅ 已创建普通索引 idx_card_hash, idx_status, idx_user_status")
         except pymysql.MySQLError as e:
-            if e.args[0] == 1061:  # Duplicate key name 错误
-                logger.debug("ℹ️ 条件唯一索引 uk_card_hash_active 已存在，跳过创建")
+            if e.args[0] == 1061:  # Duplicate key name
+                logger.debug("ℹ️ 索引已存在，跳过创建")
             else:
-                logger.warning(f"⚠️ 创建条件唯一索引失败: {e}")
+                logger.warning(f"⚠️ 创建索引失败: {e}")
 
         self._init_finance_accounts(cursor)
         logger.info("数据库表结构初始化完成")

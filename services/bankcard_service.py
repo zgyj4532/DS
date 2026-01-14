@@ -1,5 +1,6 @@
 # services/bankcard_service.py
-# 统一银行卡管理服务 - 微信接口对齐版（防跨用户重复绑定 - 最终版）
+# 统一银行卡管理服务 - 微信接口对齐版（防跨用户重复绑定 - 生产级修复版）
+import asyncio
 
 import pymysql
 import json
@@ -7,6 +8,7 @@ import os
 import hashlib
 import re
 import uuid
+import base64
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 from fastapi import HTTPException
@@ -14,7 +16,6 @@ from fastapi import HTTPException
 from core.database import get_conn
 from core.logging import get_logger
 from core.wx_pay_client import wxpay_client
-from core.table_access import build_dynamic_select, build_dynamic_insert, build_dynamic_update
 
 logger = get_logger(__name__)
 
@@ -160,7 +161,7 @@ class BankcardService:
             else:
                 # 非掩码格式（测试环境）
                 logger.warning("微信返回非掩码卡号，测试环境特征")
-                if wechat_masked != local_number:
+                if wechat_masked.replace(' ', '') != local_number.replace(' ', ''):
                     return False, "卡号不匹配"
 
             # 第三步：验证开户行（忽略大小写和空格）
@@ -198,7 +199,7 @@ class BankcardService:
         Returns:
             Tuple[bool, Optional[int]]: (是否唯一, 已绑定的用户ID)
         """
-        # ✅ 优化点1：空哈希值抛出异常，而非返回None
+        # ✅ 防御性检查：空哈希值抛出异常
         if not card_hash or not isinstance(card_hash, str) or len(card_hash) == 0:
             raise ValueError("卡号哈希不能为空或无效")
 
@@ -311,7 +312,7 @@ class BankcardService:
                                 }
                         except Exception as e:
                             logger.warning(f"解密已有卡号失败: {e}")
-                            # 继续执行更新逻辑
+                            existing_number = None
 
                     # 7. 获取现有记录（用于更新或插入）
                     cur.execute(
@@ -427,7 +428,7 @@ class BankcardService:
                     try:
                         # 只解密尾号
                         full_number = BankcardService._decrypt_local_encrypted(
-                            account['account_number_encrypted'], key
+                            account['account_number_encrypted']
                         )
                         tail4 = full_number[-4:]
 
@@ -485,7 +486,7 @@ class BankcardService:
                 return {"account_id": account_id, "is_default": 1, "msg": "设置成功"}
 
     @staticmethod
-    def modify_bankcard(
+    async def modify_bankcard(
             user_id: int, new_bank_name: str, new_bank_account: str, new_account_name: str,
             bank_branch_id: Optional[str], bank_address_code: Optional[str],
             admin_key: Optional[str], ip_address: Optional[str]
@@ -551,7 +552,7 @@ class BankcardService:
                                 break
                             else:
                                 # 等待5秒后重试
-                                time.sleep(5)
+                                await asyncio.sleep(5)
                         else:
                             # 30秒后仍为审核中，拒绝新申请
                             raise Exception("F017: 已存在进行中的改绑申请，请等待当前申请完成")
@@ -672,7 +673,7 @@ class BankcardService:
 
     @staticmethod
     def poll_modify_status(user_id: int, application_no: str) -> Dict[str, Any]:
-        """轮询改绑审核状态（带最终冲突检测）"""
+        """轮询改绑审核状态（带最终冲突检测和旧卡恢复）"""
         logger.info(f"【轮询改绑状态】user_id={user_id}, application_no={application_no}")
 
         # 1. 先查询本地状态
@@ -739,7 +740,7 @@ class BankcardService:
                             f"bound_user_id={bound_user_id}, application_no={application_no}"
                         )
 
-                        # ✅ 优化点2：记录审计日志
+                        # 记录审计日志
                         BankcardService._log_operation_async(
                             user_id,
                             "modify_conflict",
@@ -750,21 +751,75 @@ class BankcardService:
                             "127.0.0.1"
                         )
 
-                        # 清理改绑数据，保留旧卡
-                        cur.execute("""
-                            UPDATE merchant_settlement_accounts
-                            SET modify_application_no = NULL,
-                                new_account_number_encrypted = NULL,
-                                new_account_name_encrypted = NULL,
-                                new_bank_name = NULL,
-                                old_account_backup = NULL,
-                                modify_fail_reason = '审核期间卡被其他用户绑定',
-                                updated_at = NOW()
-                            WHERE id = %s
-                        """, (record["id"],))
+                        # ✅ BUG修复：恢复旧卡信息到主字段
+                        try:
+                            old_backup = record['old_account_backup']
+                            if isinstance(old_backup, str):
+                                old_backup = json.loads(old_backup)
+                            if old_backup:
+                                cur.execute("""
+                                    UPDATE merchant_settlement_accounts
+                                    SET account_bank = %s,
+                                        bank_name = %s,
+                                        account_name_encrypted = %s,
+                                        account_number_encrypted = %s,
+                                        account_type = %s,
+                                        bank_branch_id = %s,
+                                        bank_address_code = %s,
+                                        card_hash = %s,
+                                        verify_result = 'VERIFY_FAIL',
+                                        modify_application_no = NULL,
+                                        modify_fail_reason = %s,
+                                        new_account_number_encrypted = NULL,
+                                        new_account_name_encrypted = NULL,
+                                        new_bank_name = NULL,
+                                        old_account_backup = NULL,
+                                        updated_at = NOW()
+                                    WHERE id = %s
+                                """, (
+                                    old_backup.get('account_bank', ''),
+                                    old_backup.get('bank_name', ''),
+                                    old_backup.get('account_name_encrypted', ''),
+                                    old_backup.get('account_number_encrypted', ''),
+                                    old_backup.get('account_type', 'BANK_ACCOUNT_TYPE_PERSONAL'),
+                                    old_backup.get('bank_branch_id'),
+                                    old_backup.get('bank_address_code', '100000'),
+                                    BankcardService._generate_card_hash(
+                                        BankcardService._decrypt_local_encrypted(old_backup.get('account_number_encrypted', ''))
+                                    ),
+                                    f"改绑冲突：新卡已被用户{bound_user_id}绑定",
+                                    record["id"]
+                                ))
+                            else:
+                                # 无备份数据，直接清理改绑字段
+                                cur.execute("""
+                                    UPDATE merchant_settlement_accounts
+                                    SET modify_application_no = NULL,
+                                        new_account_number_encrypted = NULL,
+                                        new_account_name_encrypted = NULL,
+                                        new_bank_name = NULL,
+                                        old_account_backup = NULL,
+                                        modify_fail_reason = '改绑冲突：新卡已被占用',
+                                        updated_at = NOW()
+                                    WHERE id = %s
+                                """, (record["id"],))
+                        except Exception as e:
+                            logger.error(f"恢复旧卡失败: {e}")
+                            # 最坏情况：清理改绑数据
+                            cur.execute("""
+                                UPDATE merchant_settlement_accounts
+                                SET modify_application_no = NULL,
+                                    new_account_number_encrypted = NULL,
+                                    new_account_name_encrypted = NULL,
+                                    new_bank_name = NULL,
+                                    old_account_backup = NULL,
+                                    modify_fail_reason = '系统错误：改绑冲突后恢复失败',
+                                    updated_at = NOW()
+                                WHERE id = %s
+                            """, (record["id"],))
+
                         conn.commit()
 
-                        # ✅ 优化点3：抛出异常而非返回错误字典
                         raise Exception(f"F021: 新卡已被其他用户(user_id={bound_user_id})绑定，改绑失败")
 
                     # 成功：更新为新卡信息
@@ -874,12 +929,17 @@ class BankcardService:
 
                 # 检查改绑状态
                 if local_record.get('modify_application_no'):
-                    result['modify_status'] = 'in_progress'
                     result['modify_application_no'] = local_record['modify_application_no']
-
-                    # 如果失败，返回失败原因
-                    if local_record['verify_result'] == 'VERIFY_FAIL':
+                    # ✅ BUG修复：根据verify_result显示准确状态
+                    if local_record['verify_result'] == 'VERIFYING':
+                        result['modify_status'] = 'in_progress'
+                    elif local_record['verify_result'] == 'VERIFY_FAIL':
+                        result['modify_status'] = 'failed'
                         result['modify_fail_reason'] = local_record.get('modify_fail_reason', '未知原因')
+                    else:
+                        result['modify_status'] = 'completed'
+                else:
+                    result['modify_status'] = 'none'
 
                 return result
 
@@ -958,12 +1018,16 @@ class BankcardService:
                         "bind_at": record['bind_at'].strftime('%Y-%m-%d %H:%M:%S') if record['bind_at'] else None
                     }
 
-                    # 改绑状态
+                    # ✅ BUG修复：根据modify_application_no和verify_result准确显示改绑状态
                     if record['modify_application_no']:
-                        result['modify_status'] = 'in_progress'
                         result['modify_application_no'] = record['modify_application_no']
-                        if record['verify_result'] == 'VERIFY_FAIL' and record['modify_fail_reason']:
+                        if record['verify_result'] == 'VERIFYING':
+                            result['modify_status'] = 'in_progress'
+                        elif record['verify_result'] == 'VERIFY_FAIL' and record['modify_fail_reason']:
+                            result['modify_status'] = 'failed'
                             result['modify_fail_reason'] = record['modify_fail_reason']
+                        else:
+                            result['modify_status'] = 'completed'
                     else:
                         result['modify_status'] = 'none'
 
@@ -984,8 +1048,8 @@ class BankcardService:
     ):
         """审计日志（同步写入）"""
         # 过滤敏感字段
-        safe_old = {k: v for k, v in (old_val or {}).items() if 'encrypted' not in k and 'card' not in k.lower()}
-        safe_new = {k: v for k, v in (new_val or {}).items() if 'encrypted' not in k and 'card' not in k.lower()}
+        safe_old = {k: str(v) for k, v in (old_val or {}).items() if 'encrypted' not in k and 'card' not in k.lower()}
+        safe_new = {k: str(v) for k, v in (new_val or {}).items() if 'encrypted' not in k and 'card' not in k.lower()}
 
         try:
             with get_conn() as conn:
@@ -1030,7 +1094,14 @@ class BankcardService:
 
     @staticmethod
     def _decrypt_local_encrypted(encrypted_data: str, key: Optional[bytes] = None) -> str:
-        """本地AES-GCM解密"""
+        """本地AES-GCM解密（含Mock处理）"""
+        if encrypted_data.startswith("MOCK_ENC_"):
+            try:
+                raw = base64.b64decode(encrypted_data).decode()
+                # 格式: MOCK_ENC_{timestamp}_{plain}_{random}
+                return raw.split('_')[3]
+            except Exception:
+                return encrypted_data
         if key is None:
             key = wxpay_client.apiv3_key[:32]
         return wxpay_client._decrypt_local(encrypted_data, key)
