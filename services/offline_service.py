@@ -1,7 +1,11 @@
 # services/offline_service.py
+from __future__ import annotations
 from decimal import Decimal
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from wechatpayv3 import WeChatPay      # 仅为静态检查服务
 
 from core.database import get_conn
 from core.config import settings
@@ -9,9 +13,25 @@ from core.logging import get_logger
 from services.finance_service import FinanceService
 from services.notify_service import notify_merchant
 import pymysql
-from wechatpayv3 import WeChatPay
+import xmltodict
 
 logger = get_logger(__name__)
+
+# -------------- 运行时 wxpay 初始化 --------------
+if not settings.WX_MOCK_MODE:
+    from wechatpayv3 import WeChatPay, WeChatPayType
+    wxpay: WeChatPay = WeChatPay(
+        wechatpay_type=WeChatPayType.MINIPROG,
+        mchid=settings.WECHAT_PAY_MCH_ID,
+        private_key=settings.WECHAT_PAY_API_KEY_PATH,  # 你的真实配置
+        cert_serial_no=settings.WECHAT_CERT_SERIAL_NO,
+        apiv3_key=settings.WECHAT_PAY_API_V3_KEY,
+        appid=settings.WECHAT_APP_ID,
+        public_key=settings.WECHAT_PAY_PUBLIC_KEY_PATH,
+        public_key_id=settings.WECHAT_PAY_PUB_KEY_ID,
+    )
+else:
+    wxpay: WeChatPay | None = None
 
 
 class OfflineService:

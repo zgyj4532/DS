@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends, Request, Response
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
-
+from typing import Union
 from core.database import get_conn
 from core.auth import get_current_user          # 如需登录鉴权
 from core.logging import get_logger
@@ -125,8 +125,9 @@ async def unified_order(
 # ------------------ 5. 支付回调 ------------------
 @router.post("/zhifu/notify", summary="微信回调")
 async def pay_notify(request: Request):
-    raw_body = await request.body()          # ← 二进制
-    result = await OfflineService.handle_notify(raw_body)
+    raw_body = await request.body()
+    # 唯一变动：把原来 OfflineService.handle_notify 换成新的 handle_pay_notify
+    result = await handle_pay_notify(raw_body)
     return Response(content=result, media_type="application/xml")
 
 

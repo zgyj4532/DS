@@ -1,4 +1,12 @@
 # services/notify_service.py
+from __future__ import annotations
+from typing import TYPE_CHECKING, Union   # 补充 Union
+
+if TYPE_CHECKING:
+    from wechatpayv3 import WeChatPay
+    from core.config import Settings
+
+# 下面是你原来的 import 列表
 import httpx
 from decimal import Decimal
 from datetime import datetime
@@ -6,6 +14,12 @@ from pathlib import Path
 from core.config import settings
 from core.logging import get_logger
 from core.database import get_conn
+
+logger = get_logger(__name__)
+
+# 给全局变量加类型标注（仅静态检查用）
+wxpay: WeChatPay | None
+settings: Settings
 
 logger = get_logger(__name__)
 
@@ -134,3 +148,81 @@ async def notify_merchant(merchant_id: int, order_no: str, amount: int) -> None:
     await _transfer_to_user(openid, amount_dec, f"线下订单{order_no}收款")
     # 2. 模板消息
     await _notify_template(openid, order_no, amount_dec)
+
+# ====================== 支付回调（统一下单） ======================
+async def handle_pay_notify(raw_body: Union[bytes, str]) -> str:
+    """
+    微信 V3 支付异步通知
+    验签 → 幂等 → 真正扣积分/优惠券 → 财务结算 → 更新订单状态
+    返回微信规定的 SUCCESS
+    """
+    try:
+        # 1. 验签 & 解密
+        data = wxpay.parse_notify(raw_body)
+        logger.info(f"[pay-notify] 微信通知内容: {data}")
+        out_trade_no = data["out_trade_no"]
+        wx_total = int(data["amount"]["total"])   # 分
+
+        # 2. 事务处理
+        async with get_conn() as conn:
+            async with conn.cursor(dictionary=True) as cur:
+                cur.execute(
+                    "SELECT id,user_id,total_amount,status,delivery_way,"
+                    "pending_points,pending_coupon_id "
+                    "FROM orders WHERE order_number=%s FOR UPDATE",
+                    (out_trade_no,)
+                )
+                order = cur.fetchone()
+                if not order:
+                    raise ValueError("订单号不存在")
+                if order["status"] != "pending_pay":
+                    return "<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>"
+
+                # 3. 金额核对
+                db_total = int(Decimal(order["total_amount"]) * 100)
+                db_total -= int(order["pending_points"] or 0) * 100
+                coupon_amt = Decimal('0')
+                if order["pending_coupon_id"]:
+                    cur.execute("SELECT amount FROM coupons WHERE id=%s", (order["pending_coupon_id"],))
+                    coupon_amt = Decimal(str(cur.fetchone()["amount"]))
+                    db_total -= int(coupon_amt * 100)
+
+                if wx_total != db_total:
+                    raise ValueError(f"金额不一致 微信{wx_total}≠系统{db_total}")
+
+                # 4. 真正扣积分
+                if order["pending_points"]:
+                    cur.execute(
+                        "UPDATE users SET member_points=member_points-%s WHERE id=%s",
+                        (order["pending_points"], order["user_id"])
+                    )
+                # 5. 真正标记优惠券已使用
+                if order["pending_coupon_id"]:
+                    cur.execute(
+                        "UPDATE coupons SET status='used',used_at=NOW() WHERE id=%s",
+                        (order["pending_coupon_id"],)
+                    )
+
+                # 6. 资金结算（写流水）
+                from services.finance_service import FinanceService
+                fs = FinanceService()
+                fs.settle_order(
+                    order_no=out_trade_no,
+                    user_id=order["user_id"],
+                    order_id=order["id"],
+                    points_to_use=order["pending_points"] or 0,
+                    coupon_discount=coupon_amt,
+                    external_conn=conn
+                )
+
+                # 7. 更新订单状态
+                next_status = "pending_recv" if order["delivery_way"] == "pickup" else "pending_ship"
+                from api.order.order import OrderManager
+                OrderManager.update_status(out_trade_no, next_status, external_conn=conn)
+
+                conn.commit()
+        return "<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>"
+
+    except Exception as e:
+        logger.error(f"[pay-notify] 处理失败: {e}")
+        return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
