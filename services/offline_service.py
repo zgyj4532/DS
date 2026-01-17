@@ -10,6 +10,7 @@ from services.finance_service import FinanceService
 from services.notify_service import notify_merchant
 from pathlib import Path
 import pymysql
+import xmltodict
 from wechatpayv3 import WeChatPay
 
 logger = get_logger(__name__)
