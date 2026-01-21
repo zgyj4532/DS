@@ -1144,41 +1144,101 @@ class DatabaseManager:
     def _add_wx_applyment_foreign_keys(self, cursor):
         """微信进件主表外键"""
         try:
-            cursor.execute("ALTER TABLE wx_applyment ADD CONSTRAINT fk_wx_applyment_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
-            logger.debug("✅ wx_applyment 外键已添加")
+            cursor.execute("""
+                SELECT CONSTRAINT_NAME
+                FROM information_schema.TABLE_CONSTRAINTS
+                WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = 'wx_applyment'
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """)
+            existing = [r['CONSTRAINT_NAME'] for r in cursor.fetchall()]
+            if 'fk_wx_applyment_user' not in existing:
+                cursor.execute("ALTER TABLE wx_applyment ADD CONSTRAINT fk_wx_applyment_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+                logger.debug("✅ wx_applyment 外键已添加")
+            else:
+                logger.debug("✅ wx_applyment 外键已存在，跳过添加")
         except Exception as e:
             logger.warning(f"⚠️ wx_applyment 外键添加失败: {e}")
 
     def _add_wx_applyment_media_foreign_keys(self, cursor):
         """进件材料表外键"""
         try:
-            cursor.execute("ALTER TABLE wx_applyment_media ADD CONSTRAINT fk_media_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
-            logger.debug("✅ wx_applyment_media 外键已添加")
+            cursor.execute("""
+                SELECT CONSTRAINT_NAME
+                FROM information_schema.TABLE_CONSTRAINTS
+                WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = 'wx_applyment_media'
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """)
+            existing = [r['CONSTRAINT_NAME'] for r in cursor.fetchall()]
+            if 'fk_media_user' not in existing:
+                cursor.execute("ALTER TABLE wx_applyment_media ADD CONSTRAINT fk_media_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+                logger.debug("✅ wx_applyment_media 外键已添加")
+            else:
+                logger.debug("✅ wx_applyment_media 外键已存在，跳过添加")
         except Exception as e:
             logger.warning(f"⚠️ wx_applyment_media 外键添加失败: {e}")
 
     def _add_merchant_settlement_accounts_foreign_keys(self, cursor):
         """结算账户表外键"""
         try:
-            cursor.execute("ALTER TABLE merchant_settlement_accounts ADD CONSTRAINT fk_merchant_account_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
-            logger.debug("✅ merchant_settlement_accounts 外键已添加")
+            cursor.execute("""
+                SELECT CONSTRAINT_NAME
+                FROM information_schema.TABLE_CONSTRAINTS
+                WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = 'merchant_settlement_accounts'
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """)
+            existing = [r['CONSTRAINT_NAME'] for r in cursor.fetchall()]
+            if 'fk_merchant_account_user' not in existing:
+                cursor.execute("ALTER TABLE merchant_settlement_accounts ADD CONSTRAINT fk_merchant_account_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+                logger.debug("✅ merchant_settlement_accounts 外键已添加")
+            else:
+                logger.debug("✅ merchant_settlement_accounts 外键已存在，跳过添加")
         except Exception as e:
             logger.warning(f"⚠️ merchant_settlement_accounts 外键添加失败: {e}")
 
     def _add_merchant_realname_verification_foreign_keys(self, cursor):
         """实名认证表外键"""
         try:
-            cursor.execute("ALTER TABLE merchant_realname_verification ADD CONSTRAINT fk_realname_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
-            logger.debug("✅ merchant_realname_verification 外键已添加")
+            cursor.execute("""
+                SELECT CONSTRAINT_NAME
+                FROM information_schema.TABLE_CONSTRAINTS
+                WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = 'merchant_realname_verification'
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """)
+            existing = [r['CONSTRAINT_NAME'] for r in cursor.fetchall()]
+            if 'fk_realname_user' not in existing:
+                cursor.execute("ALTER TABLE merchant_realname_verification ADD CONSTRAINT fk_realname_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+                logger.debug("✅ merchant_realname_verification 外键已添加")
+            else:
+                logger.debug("✅ merchant_realname_verification 外键已存在，跳过添加")
         except Exception as e:
             logger.warning(f"⚠️ merchant_realname_verification 外键添加失败: {e}")
 
     def _add_user_bankcard_operations_foreign_keys(self, cursor):
         """银行卡操作日志表外键"""
         try:
-            cursor.execute("ALTER TABLE user_bankcard_operations ADD CONSTRAINT fk_bankcard_op_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
-            cursor.execute("ALTER TABLE user_bankcard_operations ADD CONSTRAINT fk_bankcard_op_target FOREIGN KEY (target_id) REFERENCES merchant_settlement_accounts(id) ON DELETE CASCADE")
-            logger.debug("✅ user_bankcard_operations 外键已添加")
+            cursor.execute("""
+                SELECT CONSTRAINT_NAME
+                FROM information_schema.TABLE_CONSTRAINTS
+                WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = 'user_bankcard_operations'
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """)
+            existing = [r['CONSTRAINT_NAME'] for r in cursor.fetchall()]
+            if 'fk_bankcard_op_user' not in existing:
+                cursor.execute("ALTER TABLE user_bankcard_operations ADD CONSTRAINT fk_bankcard_op_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+            else:
+                logger.debug("✅ user_bankcard_operations: fk_bankcard_op_user 已存在，跳过添加")
+
+            if 'fk_bankcard_op_target' not in existing:
+                cursor.execute("ALTER TABLE user_bankcard_operations ADD CONSTRAINT fk_bankcard_op_target FOREIGN KEY (target_id) REFERENCES merchant_settlement_accounts(id) ON DELETE CASCADE")
+            else:
+                logger.debug("✅ user_bankcard_operations: fk_bankcard_op_target 已存在，跳过添加")
+
+            logger.debug("✅ user_bankcard_operations 外键处理完成")
         except Exception as e:
             logger.warning(f"⚠️ user_bankcard_operations 外键添加失败: {e}")
 
