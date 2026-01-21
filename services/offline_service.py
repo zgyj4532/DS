@@ -15,6 +15,8 @@ from services.notify_service import notify_merchant
 from pathlib import Path
 import pymysql
 import xmltodict
+import base64
+from services.wechat_api import get_wxacode
 
 logger = get_logger(__name__)
 
@@ -65,7 +67,10 @@ class OfflineService:
         current_user_id = str(user_id)  # Bearer UUID
         order_no = f"OFF{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:6]}"
         expire = datetime.now() + timedelta(seconds=settings.qrcode_expire_seconds)
-        qrcode_url = f"https://your-domain.com/offline/pay?order_no={order_no}&r={invite_code}"
+        path = f"pages/offline/pay?orderNo=$(商品订单号}}&channel=1"
+        scene = f"o={order_no}&r={invite_code or ''}"
+        qrcode_b64 = base64.b64encode(await get_wxacode(path=path, scene=scene)).decode()
+        qrcode_url = f"data:image/png;base64,{qrcode_b64}"  
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -80,7 +85,7 @@ class OfflineService:
                 conn.commit()
 
         logger.info(f"[Offline] 创建订单 {order_no} 金额 {amount} 商户={current_user_id}")
-        return {"order_no": order_no, "qrcode_url": qrcode_url, "expire_at": expire}
+        return {"order_no": order_no, "qrcode_b64": qrcode_b64, "expire_at": expire}
 
     # ---------- 2. 刷新收款码（限 1 次） ----------
     @staticmethod
@@ -104,22 +109,21 @@ class OfflineService:
                     raise ValueError("收款码已刷新一次，请重新创建订单")
 
                 r = row["r"] or ""          # 取到原推荐码
-                new_url = (
-                    f"https://your-domain.com/offline/pay"
-                    f"?order_no={order_no}&r={r}"
-                )
+                path = f"pages/offline/pay?orderNo=$(商品订单号}}&channel=1"
+                scene = f"o={order_no}&r={r}"
+                new_qrcode_b64 = base64.b64encode(await get_wxacode(path=path, scene=scene)).decode()
 
                 # 2. 写回新 URL
                 cur.execute(
                     "UPDATE offline_order "
                     "SET qrcode_url=%s, qrcode_expire=%s, refresh_count=refresh_count+1 "
                     "WHERE order_no=%s AND merchant_id=%s",
-                    (new_url, expire, order_no, current_user_id)
+                    (new_qrcode_b64, expire, order_no, current_user_id)
                 )
                 conn.commit()
 
         logger.info(f"[Offline] 刷新码 {order_no} 商户={current_user_id}")
-        return {"qrcode_url": new_url, "expire_at": expire}
+        return {"qrcode_b64": new_qrcode_b64, "expire_at": expire}
 
     # ---------- 3. 订单详情 + 可用优惠券 ----------
     @staticmethod
