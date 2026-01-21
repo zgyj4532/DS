@@ -43,6 +43,7 @@ class OfflineService:
         amount: int,
         product_name: str = "",
         remark: str = "",
+        invite_code: str = "",
         user_id: Optional[int] = None,
     ) -> dict:
         import uuid
@@ -50,7 +51,7 @@ class OfflineService:
         current_user_id = str(user_id)  # Bearer UUID
         order_no = f"OFF{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:6]}"
         expire = datetime.now() + timedelta(seconds=settings.qrcode_expire_seconds)
-        qrcode_url = f"https://your-domain.com/offline/pay?order_no={order_no}"
+        qrcode_url = f"https://your-domain.com/offline/pay?order_no={order_no}&r={invite_code}"
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -71,13 +72,14 @@ class OfflineService:
     @staticmethod
     async def refresh_qrcode(order_no: str, user_id: int) -> dict:
         expire = datetime.now() + timedelta(seconds=settings.qrcode_expire_seconds)
-        new_url = f"https://your-domain.com/offline/pay?order_no={order_no}"
-        current_user_id = str(user_id)  # Bearer UUID
+        current_user_id = str(user_id)
 
         with get_conn() as conn:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                # 1. 把原 r 取出来
                 cur.execute(
-                    "SELECT refresh_count,status FROM offline_order "
+                    "SELECT refresh_count, status, r "
+                    "FROM offline_order "
                     "WHERE order_no=%s AND merchant_id=%s",
                     (order_no, current_user_id)
                 )
@@ -87,8 +89,16 @@ class OfflineService:
                 if row["refresh_count"] >= 1:
                     raise ValueError("收款码已刷新一次，请重新创建订单")
 
+                r = row["r"] or ""          # 取到原推荐码
+                new_url = (
+                    f"https://your-domain.com/offline/pay"
+                    f"?order_no={order_no}&r={r}"
+                )
+
+                # 2. 写回新 URL
                 cur.execute(
-                    "UPDATE offline_order SET qrcode_url=%s,qrcode_expire=%s,refresh_count=refresh_count+1 "
+                    "UPDATE offline_order "
+                    "SET qrcode_url=%s, qrcode_expire=%s, refresh_count=refresh_count+1 "
                     "WHERE order_no=%s AND merchant_id=%s",
                     (new_url, expire, order_no, current_user_id)
                 )

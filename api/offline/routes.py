@@ -10,6 +10,7 @@ from core.logging import get_logger
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from services.offline_service import OfflineService   # 业务逻辑层（稍后实现）
 import xmltodict
+from services.notify_service import handle_pay_notify
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -25,6 +26,7 @@ class CreateOrderReq(BaseModel):
     amount: int = Field(..., gt=0)
     product_name: str = ""
     remark: str = ""
+    r: str = ""
 
 
 class CreateOrderRsp(BaseModel):
@@ -60,6 +62,7 @@ async def create_offline_order(
             amount=req.amount,
             product_name=req.product_name,
             remark=req.remark,
+            r=req.invite_code,
             user_id=current_user["id"]
         )
         return {"code": 0, "message": "下单成功", "data": result}
