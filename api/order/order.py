@@ -266,6 +266,62 @@ class OrderManager:
 
                 return orders
 
+    @staticmethod
+    def detail(order_number: str) -> Optional[dict]:
+        """查询单个订单详情（含用户、地址、商品明细）。"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                select_fields = OrderManager._build_orders_select(cur)
+                cur.execute(
+                    f"SELECT {select_fields} FROM orders WHERE order_number=%s LIMIT 1",
+                    (order_number,)
+                )
+                order = cur.fetchone()
+                if not order:
+                    return None
+
+                order_id = order.get("id")
+                user_id = order.get("user_id")
+
+                # 商品明细
+                cur.execute(
+                    """
+                    SELECT oi.*, p.name AS product_name, p.is_member_product, p.cover AS product_cover
+                    FROM order_items oi
+                    LEFT JOIN products p ON oi.product_id = p.id
+                    WHERE oi.order_id = %s
+                    """,
+                    (order_id,)
+                )
+                items = cur.fetchall()
+
+                # 用户信息
+                user_info = None
+                if user_id:
+                    cur.execute(
+                        "SELECT id, name, mobile, avatar, member_level, member_points FROM users WHERE id=%s",
+                        (user_id,)
+                    )
+                    user_info = cur.fetchone()
+
+                # 地址信息直接取订单中的收货字段
+                address = {
+                    "consignee_name": order.get("consignee_name"),
+                    "consignee_phone": order.get("consignee_phone"),
+                    "province": order.get("province"),
+                    "city": order.get("city"),
+                    "district": order.get("district"),
+                    "detail": order.get("shipping_address"),
+                }
+
+                return {
+                    "order_info": order,
+                    "user": user_info,
+                    "address": address,
+                    "items": items,
+                    "specifications": order.get("refund_reason"),
+                }
+
 
 
 
@@ -524,9 +580,9 @@ def export_orders(body: OrderExportRequest):
     if not body.order_numbers:
         raise HTTPException(status_code=422, detail="订单号列表不能为空")
 
-    # 限制一次最多导出100个订单
-    if len(body.order_numbers) > 100:
-        raise HTTPException(status_code=422, detail="单次导出订单数不能超过100个")
+    # 限制一次最多导出1000个订单
+    if len(body.order_numbers) > 1000:
+        raise HTTPException(status_code=422, detail="单次导出订单数不能超过1000个")
 
     try:
         excel_data = OrderManager.export_to_excel(body.order_numbers)

@@ -713,6 +713,7 @@ class FinanceService:
         # ==================== 核心修复：构建完整推荐链 ============================
         current_id = buyer_id
         referrer_chain = []  # 存储完整的推荐链
+        visited = {buyer_id}  # 防止自指或循环
 
         for current_layer in range(1, MAX_TEAM_LAYER + 1):
             cur.execute(
@@ -726,6 +727,12 @@ class FinanceService:
                 break
 
             referrer_id = ref['referrer_id']
+
+            # 避免自指或循环导致自己拿团队奖
+            if referrer_id in visited:
+                logger.debug(f"推荐链出现自指/循环（用户{referrer_id}），停止发放团队奖励")
+                break
+            visited.add(referrer_id)
             cur.execute("SELECT member_level FROM users WHERE id = %s", (referrer_id,))
             user_row = cur.fetchone()
             referrer_level = user_row.get('member_level', 0) if user_row else 0
@@ -762,6 +769,9 @@ class FinanceService:
                 if candidate['layer'] < target_layer:
                     continue  # L2奖励不能由L1用户获得
                 # ====================================================================
+
+                if candidate['user_id'] == buyer_id:
+                    continue  # 仅本人一人时不发团队奖励给自己
 
                 if candidate['member_level'] >= target_layer:
                     # 找到第一个满足条件的用户（按层数从小到大）

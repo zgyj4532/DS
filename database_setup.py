@@ -85,6 +85,7 @@ class DatabaseManager:
                     referral_code VARCHAR(6) NULL COMMENT '推荐码',
                     withdrawable_balance DECIMAL(14,2) NOT NULL DEFAULT 0.00 COMMENT '可提现余额',
                     avatar_path VARCHAR(255) NULL DEFAULT NULL COMMENT '头像路径',
+                    avatar VARCHAR(255) NULL DEFAULT NULL COMMENT '头像',
                     is_merchant TINYINT NOT NULL DEFAULT 0 COMMENT '0=普通用户,1=商家,2=第三方/平台',
                     six_director INT NULL DEFAULT 0 COMMENT '直推六星人数，用于荣誉董事晋升判定',
                     six_team INT NULL DEFAULT 0 COMMENT '团队六星人数，用于荣誉董事晋升判定',
@@ -111,6 +112,7 @@ class DatabaseManager:
                     pinyin TEXT,
                     description TEXT,
                     category VARCHAR(100),
+                    cover VARCHAR(500) NULL COMMENT '商品封面图',
                     main_image VARCHAR(500),
                     detail_images TEXT,
                     is_member_product TINYINT(1) NOT NULL DEFAULT 0,
@@ -708,6 +710,7 @@ class DatabaseManager:
                 'is_merchant': 'is_merchant TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'判断是不是商家\'',
                 'status': 'status TINYINT NOT NULL DEFAULT 1',
                 'avatar_path': 'avatar_path VARCHAR(255) NULL DEFAULT NULL COMMENT \'头像路径\'',
+                'avatar': 'avatar VARCHAR(255) NULL DEFAULT NULL COMMENT \'头像\'',
                 'six_director': 'six_director INT NULL DEFAULT 0 COMMENT \'直推六星人数，用于荣誉董事晋升判定\'',
                 'six_team': 'six_team INT NULL DEFAULT 0 COMMENT \'团队六星人数，用于荣誉董事晋升判定\'',
                 'subsidy_points': 'subsidy_points DECIMAL(12,4) NOT NULL DEFAULT 0.0000 COMMENT \'周补贴专用点数\'',
@@ -744,6 +747,9 @@ class DatabaseManager:
             'coupons': {
                 # 检查并添加 applicable_product_type 字段
                 'applicable_product_type': "applicable_product_type ENUM('all','normal_only','member_only') NOT NULL DEFAULT 'all' COMMENT '优惠券适用商品范围：all=不限制，normal_only=仅普通商品，member_only=仅会员商品'",
+            },
+            'products': {
+                'cover': "cover VARCHAR(500) NULL COMMENT '商品封面图'",
             }
         }
         
