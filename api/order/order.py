@@ -682,11 +682,38 @@ def order_pay(body: OrderPay):
                     f"/order/pay 不再重复调用微信接口"
                 )
             else:
-                logger.debug(
-                    f"订单{body.order_number}微信支付单已存在，/order/pay 跳过统一下单，"
-                    f"等待 /wechat-pay/notify 异步结算"
-                )
+                import services.notify_service as ns
+                req = {
+                    "appid": settings.WECHAT_APP_ID,
+                    "mchid": settings.WECHAT_PAY_MCH_ID,
+                    "description": f"订单{body.order_number}",
+                    "out_trade_no": body.order_number,
+                    "notify_url": settings.WECHAT_PAY_NOTIFY_URL,
+                    "amount": {"total": cash_fee, "currency": "CNY"}
+                }
+                # 获取用户 openid（优先从 users 表读取），若无则提示前端传入或绑定
+                cur.execute("SELECT openid FROM users WHERE id=%s", (user_id,))
+                user_row = cur.fetchone()
+                openid = (user_row.get('openid') if user_row else None) or ''
+                if not openid:
+                    logger.error(f"下单失败：用户 {user_id} 未绑定 openid，无法创建 JSAPI 支付单")
+                    raise HTTPException(status_code=422, detail="缺少 openid：请在小程序端传入或在用户资料中绑定 openid")
 
+                # 将 payer.openid 填入请求，供 async_unified_order 使用
+                req["payer"] = {"openid": openid}
+                try:
+                    import asyncio
+                    # 在 AnyIO 的线程池中可能没有当前事件循环，使用 asyncio.run 在独立循环中执行协程
+                    asyncio.run(ns.async_unified_order(req))
+                except Exception as e:
+                    msg = str(e)
+                    logger.error(f"微信下单失败: {msg}")
+                    if '参数与首次请求时不一致' in msg or 'INVALID_REQUEST' in msg:
+                        # WeChat 对同一 out_trade_no 的重复请求要求参数一致，若不一致会返回该错误
+                        raise HTTPException(status_code=409, detail="微信已存在相同订单号且参数与首次请求不一致，请使用新的订单号重试或联系客服处理")
+                    raise HTTPException(status_code=502, detail="生成支付单失败")
+
+            # 7. 原样返回成功（前端收到后自行调起微信 SDK）
             conn.commit()
 
     # 6. 直接返回成功（前端已拿到 WechatPayParams，这里只做校验+暂存）

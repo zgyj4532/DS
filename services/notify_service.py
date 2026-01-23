@@ -247,11 +247,27 @@ async def async_unified_order(req: dict) -> dict:
     import anyio
 
     def _sync_call():
-        return wxpay_client.create_jsapi_order(
-            out_trade_no=str(out_trade_no),
-            total_fee=int(total),
-            openid=str(openid),
-            description=req.get('description', '')
-        )
+        try:
+            return wxpay_client.create_jsapi_order(
+                out_trade_no=str(out_trade_no),
+                total_fee=int(total),
+                openid=str(openid),
+                description=req.get('description', '')
+            )
+        except Exception as e:
+            # 如果底层是 requests.HTTPError，尝试提取 response 内容以便上层返回友好错误
+            try:
+                import requests
+                if isinstance(e, requests.exceptions.HTTPError) and hasattr(e, 'response'):
+                    resp = e.response
+                    body = ''
+                    try:
+                        body = resp.text
+                    except Exception:
+                        body = str(resp)
+                    raise RuntimeError(f"WeChat create_jsapi_order failed: status={getattr(resp, 'status_code', '')} body={body}")
+            except Exception:
+                pass
+            raise
 
     return await anyio.to_thread.run_sync(_sync_call)
