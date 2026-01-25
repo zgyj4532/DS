@@ -334,7 +334,7 @@ class OrderManager:
             "public_welfare": "公益基金",
             "maintain_pool": "平台维护",
             "subsidy_pool": "周补贴池",
-            "director_pool": "荣誉董事分红",
+            "director_pool": "联创奖励",
             "shop_pool": "社区店",
             "city_pool": "城市运营中心",
             "branch_pool": "大区分公司",
@@ -409,7 +409,7 @@ class OrderManager:
                     items = order_data["items"]
                     specifications = order_data.get("specifications") or {}
 
-                    # 计算实付金额
+                    # 计算实付金额（用于计算20%平台抽成）
                     total = Decimal(str(order_info.get("total_amount", 0)))
                     points_discount = Decimal(str(order_info.get("points_discount", 0)))
                     actual_pay = total - points_discount
@@ -471,16 +471,31 @@ class OrderManager:
                     """, (f"%{order_number}%",))
 
                     flows = cur.fetchall()
+
+                    # 计算平台抽成总额（20%）
+                    platform_fee = float(actual_pay) * 0.2
+
                     for flow in flows:
-                        # 转换账户类型为中文
                         account_type_en = flow.get("account_type", "")
-                        account_type_cn = account_type_map.get(account_type_en, account_type_en)
+
+                        # 特殊处理：商家余额显示为X雨点（20%）
+                        if account_type_en == "merchant_balance":
+                            display_amount = f"{int(platform_fee)}雨点"
+                            account_type_cn = "雨点余额"  # ← 改回"商家余额"
+                            balance_after_display = "-"
+                            is_platform_fee_row = True
+                        else:
+                            # 其他账户类型正常显示
+                            account_type_cn = account_type_map.get(account_type_en, account_type_en)
+                            display_amount = float(flow.get("change_amount", 0))
+                            balance_after_display = float(flow.get("balance_after", 0))
+                            is_platform_fee_row = False
 
                         row_data2 = [
                             order_number,
-                            account_type_cn,  # 使用中文
-                            float(flow.get("change_amount", 0)),
-                            float(flow.get("balance_after", 0)),
+                            account_type_cn,
+                            display_amount,
+                            balance_after_display,
                             flow.get("flow_type", ""),
                             flow.get("remark", ""),
                             flow.get("created_at", "")
@@ -490,7 +505,9 @@ class OrderManager:
                             cell = ws2.cell(row=row_idx2, column=col_idx, value=value)
                             cell.alignment = Alignment(vertical="center")
                             cell.border = thin_border
-                            if col_idx in [3, 4]:  # 金额列
+
+                            # 只有非商家余额行才设置货币格式
+                            if col_idx in [3, 4] and not is_platform_fee_row:
                                 cell.number_format = '¥#,##0.00'
 
                         row_idx2 += 1
