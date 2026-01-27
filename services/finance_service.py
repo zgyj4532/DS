@@ -204,13 +204,18 @@ class FinanceService:
             if points_to_use > Decimal('0'):
                 self._apply_points_discount_v2(cur, user_id, user, points_to_use, total_amount, order_id)
 
-            # 6. 更新订单主表
+            # 6. 更新订单主表（自提订单直接进入待收货）
+            cur.execute("SELECT delivery_way FROM orders WHERE id=%s", (order_id,))
+            order_row = cur.fetchone() or {}
+            delivery_way = order_row.get("delivery_way")
+            next_status = "pending_recv" if delivery_way == "pickup" else "pending_ship"
+
             cur.execute(
                 """UPDATE orders SET 
                    merchant_id=%s, total_amount=%s, original_amount=%s,
-                   points_discount=%s, status='pending_ship', updated_at=NOW()
+                   points_discount=%s, status=%s, updated_at=NOW()
                    WHERE order_number=%s""",
-                (PLATFORM_MERCHANT_ID, final_amount, total_amount, total_discount, order_no)
+                (PLATFORM_MERCHANT_ID, final_amount, total_amount, total_discount, next_status, order_no)
             )
 
             # 7. 处理会员商品（整个订单级别一次性处理奖励）
