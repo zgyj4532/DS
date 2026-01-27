@@ -425,6 +425,11 @@ class OrderManager:
                     if isinstance(specifications, dict):
                         spec_str = "\n".join([f"{k}: {v}" for k, v in specifications.items()])
 
+                    # 判断发货时间（自提订单=支付时间）
+                    shipped_at = order_info.get("shipped_at", "")
+                    if order_info.get("delivery_way") == "pickup":
+                        shipped_at = order_info.get("paid_at", "")
+
                     # 填充订单详情行
                     row_data1 = [
                         order_info.get("order_number", ""),
@@ -449,7 +454,7 @@ class OrderManager:
                         spec_str,
                         order_info.get("created_at", ""),
                         order_info.get("paid_at", ""),
-                        order_info.get("shipped_at", "")
+                        shipped_at  # ← 使用修改后的发货时间
                     ]
 
                     for col_idx, value in enumerate(row_data1, 1):
@@ -481,7 +486,7 @@ class OrderManager:
                         # 特殊处理：商家余额显示为X雨点（20%）
                         if account_type_en == "merchant_balance":
                             display_amount = f"{int(platform_fee)}雨点"
-                            account_type_cn = "雨点余额"  # ← 改回"商家余额"
+                            account_type_cn = "商家余额"  # ← 改回"商家余额"
                             balance_after_display = "-"
                             is_platform_fee_row = True
                         else:
