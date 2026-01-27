@@ -535,6 +535,7 @@ class DatabaseManager:
                     draft_expired_at DATETIME NULL COMMENT '草稿过期时间（创建+7天）',
                     is_core_info_modified TINYINT(1) NOT NULL DEFAULT 0 COMMENT '核心信息修改标记',
                     submitted_at DATETIME NULL COMMENT '正式提交时间',
+                    is_timeout_alerted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '审核超时提醒是否已发送',
                     finished_at DATETIME NULL COMMENT '完成时间',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -750,6 +751,9 @@ class DatabaseManager:
             },
             'products': {
                 'cover': "cover VARCHAR(500) NULL COMMENT '商品封面图'",
+            },
+            'wx_applyment': {
+                'is_timeout_alerted': "is_timeout_alerted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '审核超时提醒是否已发送'",
             }
         }
         
