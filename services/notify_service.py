@@ -1,6 +1,8 @@
 # services/notify_service.py
 from __future__ import annotations
-from typing import TYPE_CHECKING, Union   # 补充 Union
+from typing import TYPE_CHECKING, Union
+
+import pymysql   # 补充 Union
 
 if TYPE_CHECKING:
     from wechatpayv3 import WeChatPay
@@ -14,8 +16,6 @@ from pathlib import Path
 from core.config import settings
 from core.logging import get_logger
 from core.database import get_conn
-
-logger = get_logger(__name__)
 
 # 给全局变量加类型标注（仅静态检查用）
 wxpay: WeChatPay | None
@@ -135,10 +135,10 @@ async def notify_merchant(merchant_id: int, order_no: str, amount: int) -> None:
     logger.info(f"[Notify] 商家{merchant_id} 订单{order_no} 到账{amount_dec:.2f}元")
 
     # 查商户 openid（需提前在 users 表保存）
-    async with get_conn() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT openid FROM users WHERE id=%s", (merchant_id,))
-            row = await cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute("SELECT openid FROM users WHERE id=%s", (merchant_id,))
+            row = cur.fetchone()
             if not row or not row["openid"]:
                 logger.warning(f"商家{merchant_id} 未绑定微信 openid，跳过微信到账")
                 return
@@ -153,8 +153,7 @@ async def notify_merchant(merchant_id: int, order_no: str, amount: int) -> None:
 async def handle_pay_notify(raw_body: Union[bytes, str]) -> str:
     """
     微信 V3 支付异步通知
-    验签 → 幂等 → 真正扣积分/优惠券 → 财务结算 → 更新订单状态
-    返回微信规定的 SUCCESS
+    支持：线上订单（orders表）和线下订单（offline_order表）
     """
     try:
         # 1. 验签 & 解密
@@ -163,14 +162,131 @@ async def handle_pay_notify(raw_body: Union[bytes, str]) -> str:
         out_trade_no = data["out_trade_no"]
         wx_total = int(data["amount"]["total"])   # 分
 
-        # 2. 事务处理
-        async with get_conn() as conn:
-            async with conn.cursor(dictionary=True) as cur:
+        # 2. 判断订单类型（线下订单以 OFF 开头）
+        if out_trade_no.startswith("OFF"):
+            # ==================== 线下订单处理逻辑 ====================
+            return await _handle_offline_pay_notify(out_trade_no, wx_total, data)
+        else:
+            # ==================== 线上订单处理逻辑（原有代码） ====================
+            return await _handle_online_pay_notify(out_trade_no, wx_total, data)
+
+    except Exception as e:
+        logger.error(f"[pay-notify] 处理失败: {e}", exc_info=True)
+        return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
+
+
+async def _handle_offline_pay_notify(order_no: str, wx_total: int, data: dict) -> str:
+    """
+    处理线下收银台订单支付回调
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                # 1. 查询线下订单并锁定
+                cur.execute(
+                    """
+                    SELECT id, user_id, amount, paid_amount, status, 
+                           coupon_id, merchant_id, store_name
+                    FROM offline_order
+                    WHERE order_no=%s FOR UPDATE
+                    """,
+                    (order_no,)
+                )
+                order = cur.fetchone()
+                
+                if not order:
+                    logger.error(f"[offline-pay] 订单不存在: {order_no}")
+                    return "<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>"
+                
+                # 2. 幂等检查：已处理过直接返回成功
+                if order["status"] != 1:  # 1=待支付
+                    logger.info(f"[offline-pay] 订单已处理: {order_no}, 状态={order['status']}")
+                    return "<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>"
+
+                # 3. 金额核对
+                db_total = int(Decimal(order["paid_amount"]) * 100) if order["paid_amount"] else int(Decimal(order["amount"]) * 100)
+                
+                if wx_total != db_total:
+                    logger.error(f"[offline-pay] 金额不一致: 微信{wx_total}≠系统{db_total}")
+                    return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
+
+                # 4. 核销优惠券（关键步骤）
+                if order["coupon_id"]:
+                    try:
+                        from services.finance_service import FinanceService
+                        fs = FinanceService()
+                        # 线下订单类型为 normal
+                        fs.use_coupon(
+                            coupon_id=order["coupon_id"],
+                            user_id=order["user_id"],
+                            order_type="normal"
+                        )
+                        logger.info(f"[offline-pay] 优惠券核销成功: 订单={order_no}, 优惠券={order['coupon_id']}")
+                    except Exception as e:
+                        # 优惠券核销失败不应影响订单状态，记录错误人工处理
+                        logger.error(f"[offline-pay] 优惠券核销失败（需人工处理）: 订单={order_no}, 错误={e}")
+                        # 可以在这里发送告警通知管理员
+
+                # 5. 更新订单状态为已支付（status=2）
+                cur.execute(
+                    """
+                    UPDATE offline_order
+                    SET status = 2, 
+                        pay_time = NOW(), 
+                        transaction_id = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (data.get("transaction_id", ""), order["id"])
+                )
+                
+                # 6. 【可选】给商户转账/通知
+                try:
+                    await notify_merchant(
+                        merchant_id=order["merchant_id"],
+                        order_no=order_no,
+                        amount=wx_total  # 分
+                    )
+                except Exception as e:
+                    # 通知失败不影响订单状态，记录即可
+                    logger.error(f"[offline-pay] 商户通知失败: {e}")
+
+                # 7.资金分账：平台抽成各池 + 商户转账通知
+                try:
+                    from services.offline_service import OfflineService
+                    from decimal import Decimal
+                    
+                    await OfflineService.on_paid(
+                        order_no=order_no,
+                        amount=Decimal(order["paid_amount"]) / 100,  # 转为元
+                        coupon_discount=Decimal(order["amount"] - order["paid_amount"]) / 100 if order["coupon_id"] else Decimal(0)
+                    )
+                except Exception as e:
+                    logger.error(f"[offline-pay] 资金分账失败（需人工处理）: {e}")
+                    # 分账失败不影响支付成功，记录错误即可
+
+                conn.commit()
+                logger.info(f"[offline-pay] 线下订单支付成功: {order_no}")
+                
+        return "<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>"
+        
+    except Exception as e:
+        logger.error(f"[offline-pay] 处理失败: {e}", exc_info=True)
+        return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
+
+
+async def _handle_online_pay_notify(order_no: str, wx_total: int, data: dict) -> str:
+    """
+    处理线上商城订单支付回调（原有逻辑提取为独立函数）
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 cur.execute(
                     "SELECT id,user_id,total_amount,status,delivery_way,"
                     "pending_points,pending_coupon_id "
                     "FROM orders WHERE order_number=%s FOR UPDATE",
-                    (out_trade_no,)
+                    (order_no,)
                 )
                 order = cur.fetchone()
                 if not order:
@@ -184,7 +300,9 @@ async def handle_pay_notify(raw_body: Union[bytes, str]) -> str:
                 coupon_amt = Decimal('0')
                 if order["pending_coupon_id"]:
                     cur.execute("SELECT amount FROM coupons WHERE id=%s", (order["pending_coupon_id"],))
-                    coupon_amt = Decimal(str(cur.fetchone()["amount"]))
+                    row = cur.fetchone()
+                    if row:
+                        coupon_amt = Decimal(str(row["amount"]))
                     db_total -= int(coupon_amt * 100)
 
                 if wx_total != db_total:
@@ -196,6 +314,7 @@ async def handle_pay_notify(raw_body: Union[bytes, str]) -> str:
                         "UPDATE users SET member_points=member_points-%s WHERE id=%s",
                         (order["pending_points"], order["user_id"])
                     )
+                
                 # 5. 真正标记优惠券已使用
                 if order["pending_coupon_id"]:
                     cur.execute(
@@ -207,7 +326,7 @@ async def handle_pay_notify(raw_body: Union[bytes, str]) -> str:
                 from services.finance_service import FinanceService
                 fs = FinanceService()
                 fs.settle_order(
-                    order_no=out_trade_no,
+                    order_no=order_no,
                     user_id=order["user_id"],
                     order_id=order["id"],
                     points_to_use=order["pending_points"] or 0,
@@ -218,13 +337,15 @@ async def handle_pay_notify(raw_body: Union[bytes, str]) -> str:
                 # 7. 更新订单状态
                 next_status = "pending_recv" if order["delivery_way"] == "pickup" else "pending_ship"
                 from api.order.order import OrderManager
-                OrderManager.update_status(out_trade_no, next_status, external_conn=conn)
+                OrderManager.update_status(order_no, next_status, external_conn=conn)
 
                 conn.commit()
+        
+        logger.info(f"[online-pay] 线上订单支付成功: {order_no}")
         return "<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>"
-
+        
     except Exception as e:
-        logger.error(f"[pay-notify] 处理失败: {e}")
+        logger.error(f"[online-pay] 处理失败: {e}", exc_info=True)
         return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
 
 

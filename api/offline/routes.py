@@ -13,7 +13,6 @@ import xmltodict
 from services.notify_service import handle_pay_notify
 
 logger = get_logger(__name__)
-router = APIRouter()
 security = HTTPBearer()
 router = APIRouter(
     dependencies=[Depends(security)]  # Swagger 会识别并出现锁图标
@@ -26,7 +25,6 @@ class CreateOrderReq(BaseModel):
     amount: int = Field(..., gt=0)
     product_name: str = ""
     remark: str = ""
-    r: str = ""
 
 
 class CreateOrderRsp(BaseModel):
@@ -62,7 +60,6 @@ async def create_offline_order(
             amount=req.amount,
             product_name=req.product_name,
             remark=req.remark,
-            r=req.invite_code,
             user_id=current_user["id"]
         )
         return {"code": 0, "message": "下单成功", "data": result}
@@ -107,21 +104,44 @@ async def get_order_detail(
 
 
 # ------------------ 4. 统一下单（调起支付） ------------------
-@router.post("/zhifu/tongyi", summary="统一下单")
+@router.post("/zhifu/tongyi", summary="统一下单（支持优惠券）")
 async def unified_order(
-    order_no: str = Query(...),
-    coupon_id: Optional[int] = Query(None),
-    current_user: dict = Depends(get_current_user)
+    order_no: str = Query(..., description="订单号"),
+    coupon_id: Optional[int] = Query(None, description="优惠券ID（可选）"),
+    current_user: dict = Depends(get_current_user)  # 当前扫码支付的用户（顾客）
 ):
     try:
+        # ====== 关键新增：获取支付用户的微信 openid ======
+        openid = current_user.get("openid")
+        if not openid:
+            logger.error(f"用户 {current_user['id']} 未绑定微信 openid")
+            raise HTTPException(status_code=400, detail="用户未绑定微信，无法支付")
+        
+        # 调用服务层时传递 openid
         result = await OfflineService.unified_order(
             order_no=order_no,
             coupon_id=coupon_id,
-            user_id=current_user["id"]
+            user_id=current_user["id"],
+            openid=openid  # 新增参数
         )
-        return {"code": 0, "message": "下单成功", "data": result}
+        
+        return {
+            "code": 0, 
+            "message": "统一下单成功", 
+            "data": {
+                "order_no": order_no,
+                "wechat_pay_params": result["pay_params"],
+                "amount_info": {
+                    "original_amount": result["original_amount"],
+                    "coupon_discount": result["coupon_discount"],
+                    "final_amount": result["final_amount"]
+                }
+            }
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"统一下单失败: {e}")
+        logger.error(f"统一下单失败: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
 
 
