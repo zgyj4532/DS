@@ -1,12 +1,17 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, field_validator, StringConstraints
 from typing import Optional, List, Dict, Any, Annotated
 from core.database import get_conn
-from services.finance_service import get_balance, withdraw   # 不再用 bind_bank
+from services.finance_service import get_balance, withdraw
 from decimal import Decimal
 from .refund import RefundManager
+from .wechat_shipping import WechatShippingManager, WechatShippingService
+from core.logging import get_logger
+import time
 
 router = APIRouter()
+logger = get_logger(__name__)
+
 
 class MerchantManager:
     @staticmethod
@@ -22,14 +27,14 @@ class MerchantManager:
                     AND COLUMN_NAME = 'phone'
                 """)
                 has_phone = cur.fetchone() is not None
-                
+
                 if has_phone:
                     sql = """SELECT o.*, u.name AS user_name, COALESCE(u.phone, '') AS user_phone
                              FROM orders o JOIN users u ON o.user_id=u.id"""
                 else:
                     sql = """SELECT o.*, u.name AS user_name, NULL AS user_phone
                              FROM orders o JOIN users u ON o.user_id=u.id"""
-                
+
                 params = []
                 if status:
                     sql += " WHERE o.status=%s"
@@ -46,36 +51,203 @@ class MerchantManager:
                 return orders
 
     @staticmethod
-    def ship(order_number: str, tracking_number: str) -> bool:
+    def ship(
+            order_number: str,
+            tracking_number: str,
+            express_company: Optional[str] = None,
+            sync_to_wechat: bool = True,
+            logistics_type: Optional[int] = None,
+            item_desc: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        发货：写入快递单号并把状态改为 pending_recv
+        发货：写入快递单号、更新状态，并同步到微信小程序发货管理
+
+        Args:
+            order_number: 订单号
+            tracking_number: 物流单号（实体物流必填，自提/虚拟商品可为空）
+            express_company: 快递公司编码（如"YTO"=圆通，"SF"=顺丰）
+            sync_to_wechat: 是否同步到微信发货管理（默认True）
+            logistics_type: 物流类型，1=实体物流, 2=同城配送, 3=虚拟商品, 4=用户自提
+            item_desc: 商品描述
+
+        Returns:
+            {"ok": True/False, "local_updated": True/False, "wechat_sync": {...}, "message": ""}
         """
+        result = {
+            "ok": False,
+            "local_updated": False,
+            "wechat_sync": None,
+            "message": ""
+        }
+
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 1. 查询订单信息
+                cur.execute(
+                    """SELECT o.*, u.openid, u.mobile as user_phone, u.name as user_name,
+                              o.delivery_way, o.transaction_id, o.consignee_phone
+                       FROM orders o 
+                       JOIN users u ON o.user_id = u.id 
+                       WHERE o.order_number=%s""",
+                    (order_number,)
+                )
+                order_info = cur.fetchone()
+
+                if not order_info:
+                    result["message"] = "订单不存在"
+                    return result
+
+                if order_info["status"] != "pending_ship":
+                    result["message"] = f"订单状态不正确，当前状态：{order_info['status']}"
+                    return result
+
+                transaction_id = order_info.get("transaction_id")
+                openid = order_info.get("openid")
+                delivery_way = order_info.get("delivery_way", "platform")
+
+                # 2. 更新本地订单状态
                 cur.execute(
                     "UPDATE orders SET status='pending_recv', tracking_number=%s "
                     "WHERE order_number=%s AND status='pending_ship'",
                     (tracking_number, order_number)
                 )
                 conn.commit()
-                return cur.rowcount > 0
+
+                updated = cur.rowcount > 0
+                result["local_updated"] = updated
+
+                if not updated:
+                    result["message"] = "更新订单状态失败"
+                    return result
+
+                result["ok"] = True
+                result["message"] = "本地发货成功"
+
+                # 3. 同步到微信小程序发货管理
+                if sync_to_wechat and transaction_id and openid:
+                    try:
+                        # 自动识别物流类型
+                        if logistics_type is None:
+                            logistics_type = WechatShippingService.get_logistics_type(delivery_way)
+
+                        # 构建商品描述
+                        if not item_desc:
+                            # 查询首个商品名称
+                            cur.execute(
+                                """SELECT p.name, oi.quantity 
+                                   FROM order_items oi 
+                                   JOIN products p ON oi.product_id = p.id 
+                                   WHERE oi.order_id = %s LIMIT 1""",
+                                (order_info["id"],)
+                            )
+                            item = cur.fetchone()
+                            if item:
+                                item_desc = f"{item['name']} x{item['quantity']}"
+                            else:
+                                item_desc = "商品"
+
+                        # 判断是否为顺丰（需要特殊处理联系方式）
+                        is_sfeng = express_company and express_company.upper() in ['SF', 'SFEXPRESS', '顺丰']
+
+                        # 同步到微信
+                        wx_result = WechatShippingService.sync_order_to_wechat(
+                            transaction_id=transaction_id,
+                            openid=openid,
+                            delivery_way=delivery_way,
+                            tracking_number=tracking_number,
+                            express_company=express_company,
+                            item_desc=item_desc,
+                            receiver_phone=order_info.get("consignee_phone"),
+                            is_sfeng=is_sfeng
+                        )
+
+                        result["wechat_sync"] = wx_result
+
+                        if wx_result.get("errcode") == 0:
+                            result["message"] += "，已同步到微信发货管理"
+                            logger.info(f"订单{order_number}同步到微信发货管理成功")
+                        else:
+                            error_msg = wx_result.get("errmsg", "未知错误")
+                            result["message"] += f"，同步到微信失败：{error_msg}"
+                            logger.error(f"订单{order_number}同步到微信发货管理失败：{error_msg}")
+
+                    except Exception as e:
+                        logger.error(f"同步订单{order_number}到微信发货管理异常: {e}")
+                        result["wechat_sync"] = {"error": str(e)}
+                        result["message"] += f"，同步到微信异常：{str(e)}"
+                elif sync_to_wechat:
+                    missing = []
+                    if not transaction_id:
+                        missing.append("微信支付单号")
+                    if not openid:
+                        missing.append("用户openid")
+                    result["message"] += f"，缺少信息无法同步到微信：{', '.join(missing)}"
+                    logger.warning(f"订单{order_number}缺少{', '.join(missing)}，无法同步到微信")
+
+                return result
 
     @staticmethod
     def approve_refund(order_number: str, approve: bool = True, reject_reason: Optional[str] = None):
         RefundManager.audit(order_number, approve, reject_reason)
 
-# ---------------- 路由 ----------------
+    @staticmethod
+    def notify_confirm_receive(order_number: str) -> Dict[str, Any]:
+        """
+        发送确认收货提醒到微信
+        用于物流已签收时提醒用户确认收货（每个订单只能调用一次）
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT o.transaction_id, o.order_number, o.paid_at, u.openid
+                       FROM orders o 
+                       JOIN users u ON o.user_id = u.id 
+                       WHERE o.order_number=%s AND o.status='pending_recv'""",
+                    (order_number,)
+                )
+                order_info = cur.fetchone()
+
+                if not order_info:
+                    return {"ok": False, "error": "订单不存在或状态不正确"}
+
+                if not order_info.get("transaction_id"):
+                    return {"ok": False, "error": "缺少微信支付单号"}
+
+                # 签收时间，使用当前时间
+                received_time = int(time.time())
+
+                result = WechatShippingManager.notify_confirm_receive(
+                    transaction_id=order_info["transaction_id"],
+                    received_time=received_time
+                )
+
+                if result.get("errcode") == 0:
+                    logger.info(f"订单{order_number}确认收货提醒发送成功")
+                    return {"ok": True, "data": result}
+                else:
+                    logger.error(f"订单{order_number}确认收货提醒发送失败：{result}")
+                    return {"ok": False, "error": result.get("errmsg"), "data": result}
+
+
+# ---------------- 请求模型 ----------------
 class MShip(BaseModel):
     order_number: str
     tracking_number: str
+    express_company: Optional[str] = None
+    sync_to_wechat: bool = True
+    logistics_type: Optional[int] = None  # 1=实体物流, 2=同城配送, 3=虚拟商品, 4=用户自提
+    item_desc: Optional[str] = None
+
 
 class MRefundAudit(BaseModel):
     order_number: str
     approve: bool
     reject_reason: Optional[str] = None
 
+
 class MWithdraw(BaseModel):
     amount: float
+
 
 class MBindBank(BaseModel):
     user_id: int
@@ -89,19 +261,53 @@ class MBindBank(BaseModel):
             raise ValueError("银行卡号只能为数字")
         return v
 
+
+class NotifyConfirmReceiveRequest(BaseModel):
+    order_number: str
+
+
+# ---------------- 路由 ----------------
 @router.get("/orders", summary="查询订单列表")
 def m_orders(status: Optional[str] = None):
     return MerchantManager.list_orders(status)
 
-@router.post("/ship", summary="订单发货")
+
+@router.post("/ship", summary="订单发货（自动同步微信发货管理）")
 def m_ship(body: MShip):
-    ok = MerchantManager.ship(body.order_number, body.tracking_number)
-    return {"ok": ok}
+    """
+    订单发货接口，支持同步到微信小程序发货管理
+
+    - 实体物流（快递）：需要填写 tracking_number 和 express_company
+    - 用户自提/虚拟商品：tracking_number 可为空
+
+    快递公司编码参考微信文档，常见编码：
+    - SF = 顺丰速运
+    - YTO = 圆通速递
+    - ZTO = 中通快递
+    - STO = 申通快递
+    - YD = 韵达速递
+    - EMS = EMS
+    """
+    result = MerchantManager.ship(
+        order_number=body.order_number,
+        tracking_number=body.tracking_number,
+        express_company=body.express_company,
+        sync_to_wechat=body.sync_to_wechat,
+        logistics_type=body.logistics_type,
+        item_desc=body.item_desc
+    )
+
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+
+    return result
+
 
 @router.post("/approve_refund", summary="审核退款申请")
 def m_refund_audit(body: MRefundAudit):
     MerchantManager.approve_refund(body.order_number, body.approve, body.reject_reason)
     return {"ok": True}
+
 
 @router.post("/withdraw", summary="申请提现", operation_id="merchant_withdraw")
 def m_withdraw(body: MWithdraw):
@@ -109,6 +315,7 @@ def m_withdraw(body: MWithdraw):
     if not ok:
         raise HTTPException(status_code=400, detail="余额不足")
     return {"ok": True}
+
 
 @router.post("/bind_bank", summary="绑定银行卡", operation_id="merchant_bind_bank")
 def m_bind(body: MBindBank):
@@ -129,3 +336,75 @@ def m_bind(body: MBindBank):
             )
             conn.commit()
     return {"ok": True}
+
+
+@router.post("/notify-confirm-receive", summary="发送确认收货提醒")
+def m_notify_confirm_receive(body: NotifyConfirmReceiveRequest):
+    """
+    发送确认收货提醒给用户（当物流显示已签收时调用）
+    每个订单只能调用一次
+    """
+    result = MerchantManager.notify_confirm_receive(body.order_number)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result.get("error", "发送失败"))
+    return result
+
+
+# ---------------- 微信发货管理相关接口 ----------------
+@router.get("/wechat/delivery-list", summary="获取快递公司列表")
+def get_delivery_list():
+    """获取微信小程序支持的快递公司列表"""
+    result = WechatShippingManager.get_delivery_list()
+    if result.get("errcode") != 0:
+        raise HTTPException(status_code=500, detail=result.get("errmsg", "获取失败"))
+    return result
+
+
+@router.get("/wechat/order-status/{order_number}", summary="查询订单在微信的发货状态")
+def get_wechat_order_status(order_number: str):
+    """
+    查询订单在微信小程序发货管理中的状态
+
+    订单状态：
+    - 1: 待发货
+    - 2: 已发货
+    - 3: 确认收货
+    - 4: 交易完成
+    - 5: 已退款
+    - 6: 资金待结算
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT transaction_id FROM orders WHERE order_number=%s",
+                (order_number,)
+            )
+            row = cur.fetchone()
+            if not row or not row.get("transaction_id"):
+                raise HTTPException(status_code=404, detail="订单不存在或缺少微信支付单号")
+
+            transaction_id = row["transaction_id"]
+
+    result = WechatShippingManager.get_order(transaction_id)
+    if result.get("errcode") != 0:
+        raise HTTPException(status_code=500, detail=result.get("errmsg", "查询失败"))
+    return result
+
+
+@router.post("/wechat/set-jump-path", summary="设置发货通知跳转路径")
+def set_msg_jump_path(path: str = Query(..., description="小程序页面路径，如 pages/order/detail")):
+    """
+    设置用户点击微信发货通知消息后的跳转页面
+    建议设置为订单详情页
+    """
+    result = WechatShippingManager.set_msg_jump_path(path)
+    if result.get("errcode") != 0:
+        raise HTTPException(status_code=500, detail=result.get("errmsg", "设置失败"))
+    return {"ok": True, "data": result}
+
+
+@router.get("/wechat/check-managed", summary="查询是否已开通发货管理服务")
+def check_trade_managed():
+    """查询小程序是否已开通发货信息管理服务"""
+    result = WechatShippingManager.is_trade_managed()
+    return result
