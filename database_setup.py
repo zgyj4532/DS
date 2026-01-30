@@ -160,6 +160,11 @@ class DatabaseManager:
                     pay_time DATETIME NULL COMMENT '支付成功时间',
                     delivery_way VARCHAR(20) NOT NULL DEFAULT 'platform' COMMENT '配送方式：platform-平台配送/pickup-自提',
                     expire_at DATETIME NULL COMMENT '订单过期时间（未支付订单7天后自动过期）',
+                    wechat_shipping_status TINYINT NOT NULL DEFAULT 0 COMMENT '微信发货状态：0未上传 1已上传 2上传失败 3已重新上传',
+                    wechat_shipping_time DATETIME NULL COMMENT '微信发货信息上传时间',
+                    wechat_shipping_msg VARCHAR(500) NULL COMMENT '微信发货接口返回错误信息',
+                    wechat_last_sync_time DATETIME NULL COMMENT '最后一次同步微信状态时间',
+                    wechat_shipping_retry_count TINYINT NOT NULL DEFAULT 0 COMMENT '微信发货重试次数，最多1次',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_user (user_id),
@@ -168,7 +173,32 @@ class DatabaseManager:
                     INDEX idx_pay_time (pay_time),
                     INDEX idx_created_at (created_at),
                     INDEX idx_status (status),
-                    INDEX idx_expire_at (expire_at)
+                    INDEX idx_expire_at (expire_at),
+                    INDEX idx_wechat_shipping_status (wechat_shipping_status)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            'wechat_shipping_logs': """
+                CREATE TABLE IF NOT EXISTS wechat_shipping_logs (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    order_id BIGINT UNSIGNED NOT NULL COMMENT '关联订单ID',
+                    order_number VARCHAR(50) NOT NULL COMMENT '商户订单号',
+                    transaction_id VARCHAR(64) NULL COMMENT '微信支付单号',
+                    action_type ENUM('upload', 'retry', 'query', 'sync') NOT NULL DEFAULT 'upload' COMMENT '操作类型：upload首次上传/retry重新上传/query查询状态/sync状态同步',
+                    logistics_type TINYINT NULL COMMENT '物流类型：1快递/2同城/3虚拟/4自提',
+                    express_company VARCHAR(50) NULL COMMENT '物流公司编码',
+                    tracking_no VARCHAR(128) NULL COMMENT '运单号',
+                    request_data JSON NULL COMMENT '请求微信的JSON数据',
+                    response_data JSON NULL COMMENT '微信返回的JSON数据',
+                    errcode INT NULL COMMENT '微信返回的错误码',
+                    errmsg VARCHAR(500) NULL COMMENT '微信返回的错误信息',
+                    is_success TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否成功：0失败 1成功',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_order_id (order_id),
+                    INDEX idx_order_number (order_number),
+                    INDEX idx_transaction_id (transaction_id),
+                    INDEX idx_action_type (action_type),
+                    INDEX idx_is_success (is_success),
+                    INDEX idx_created_at (created_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'offline_order': """
@@ -726,6 +756,11 @@ class DatabaseManager:
                 'expire_at': 'expire_at DATETIME NULL COMMENT \'订单过期时间（未支付订单7天后自动过期）\'',
                 'offline_order_flag': 'offline_order_flag TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'是否线下收银订单：0线上/1线下\'',
                 'applyment_id': 'applyment_id BIGINT UNSIGNED DEFAULT NULL COMMENT \'关联微信进件单ID（线下订单必填）\'',
+                'wechat_shipping_status': 'wechat_shipping_status TINYINT NOT NULL DEFAULT 0 COMMENT \'微信发货状态：0未上传 1已上传 2上传失败 3已重新上传\'',
+                'wechat_shipping_time': 'wechat_shipping_time DATETIME NULL COMMENT \'微信发货信息上传时间\'',
+                'wechat_shipping_msg': 'wechat_shipping_msg VARCHAR(500) NULL COMMENT \'微信发货接口返回错误信息\'',
+                'wechat_last_sync_time': 'wechat_last_sync_time DATETIME NULL COMMENT \'最后一次同步微信状态时间\'',
+                'wechat_shipping_retry_count': 'wechat_shipping_retry_count TINYINT NOT NULL DEFAULT 0 COMMENT \'微信发货重试次数，最多1次\'',
             },
             'order_items': {
                 'sku_id': 'sku_id BIGINT UNSIGNED NULL',
