@@ -1041,7 +1041,7 @@ class FinanceService:
 
     def get_current_points_value(self) -> Dict[str, Any]:
         """
-        查询当前积分值配置（修复版：总积分包含商家20%和平台储备积分）
+        查询当前积分值配置（修复版：总积分包含商家和平台储备积分）
 
         返回包含自动计算值和手动调整值的字典
         """
@@ -1062,7 +1062,7 @@ class FinanceService:
                 cur.execute(
                     "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
                 total_merchant_points = Decimal(str(cur.fetchone()['total'] or 0))
-                weighted_merchant_points = total_merchant_points * Decimal('0.20')
+                weighted_merchant_points = total_merchant_points
 
                 # 3. 平台储备积分（公司积分池）
                 try:
@@ -1105,7 +1105,7 @@ class FinanceService:
                 "company_points": float(company_points_balance)
             },
             "max_allowed_value": float(MAX_POINTS_VALUE),
-            "remark": "积分值 = 补贴池金额 ÷ 总系统积分（含用户积分100% + 商家积分20% + 平台储备100%），最高不超过0.02（2%）。如果设置了auto_clear=true，发放一次后会自动清除手动配置。"
+            "remark": "积分值 = 补贴池金额 ÷ 总系统积分（含用户积分100% + 商家积分100% + 平台储备100%），最高不超过0.02（2%）。如果设置了auto_clear=true，发放一次后会自动清除手动配置。"
         }
 
     def distribute_weekly_subsidy(self) -> bool:
@@ -1113,7 +1113,7 @@ class FinanceService:
         发放周补贴（修复版：商家积分按20%权重、平台积分按100%权重参与总积分计算，但只给用户发放）
 
         关键修复：
-        1. 总积分 = 用户积分(100%) + 商家积分(20%) + 平台储备积分(100%)
+        1. 总积分 = 用户积分(100%) + 商家积分(100%) + 平台储备积分(100%)
         2. 但发放对象仅限于持有 member_points > 0 的用户
         """
         logger.info("周补贴发放开始（修复版：商家和平台积分参与运算，但不发放）")
@@ -1134,7 +1134,7 @@ class FinanceService:
                 cur.execute(
                     "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
                 total_merchant_points = Decimal(str(cur.fetchone()['total'] or 0))
-                weighted_merchant_points = total_merchant_points * Decimal('0.20')
+                weighted_merchant_points = total_merchant_points
 
                 # 3. 平台储备积分（公司积分池，全额计入，只参与运算，不发放）
                 try:
@@ -1165,7 +1165,7 @@ class FinanceService:
             logger.info(f"积分价值自动计算: ¥{points_value:.4f}/分")
 
         logger.info(
-            f"补贴池: ¥{pool_balance} | 总系统积分: {total_system_points} (用户:{total_user_points} + 商家20%:{weighted_merchant_points} + 平台:{company_points_balance}) | 积分值: ¥{points_value:.4f}/分")
+            f"补贴池: ¥{pool_balance} | 总系统积分: {total_system_points} (用户:{total_user_points} + 商家:{weighted_merchant_points} + 平台:{company_points_balance}) | 积分值: ¥{points_value:.4f}/分")
 
         total_distributed = Decimal('0')
         total_points_deducted = Decimal('0')
@@ -2344,7 +2344,7 @@ class FinanceService:
                 """)
                 unilevel_users = cur.fetchall()
 
-        weighted_merchant_points = total_merchant_points * Decimal('0.20')
+        weighted_merchant_points = total_merchant_points
         platform_total_points = total_member_points + weighted_merchant_points + company_points_balance
 
         if not unilevel_users:
@@ -4520,7 +4520,7 @@ class FinanceService:
                 company_points = Decimal(str(row.get('total', 0) or 0))
 
                 # 平台总和积分 = 商家积分的20% + 消费者积分的100% + 平台储备积分
-                weighted_merchant_points = total_merchant_points * Decimal('0.20')
+                weighted_merchant_points = total_merchant_points
                 total_points = total_user_points + weighted_merchant_points + company_points
 
                 # 3. 计算积分价值（先检查手动调整）
