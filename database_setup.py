@@ -364,6 +364,8 @@ class DatabaseManager:
                     points_before DECIMAL(12,4) NOT NULL,
                     points_deducted DECIMAL(12,4) NOT NULL,
                     coupon_id BIGINT UNSIGNED,
+                    remark VARCHAR(500) NULL COMMENT '备注，用于标记平台积分池发放',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_user_week (user_id, week_start)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,

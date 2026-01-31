@@ -1160,6 +1160,52 @@ async def get_platform_flow_summary(
     except Exception as e:
         logger.error(f"平台综合流水报表生成失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+# ==================== 总积分明细报表接口（包含member/merchant/company三种积分） ====================
+@router.get("/api/reports/points/all-detail", response_model=ResponseModel, summary="总积分明细报表")
+async def get_all_points_detail_report(
+    user_id: Optional[int] = Query(None, gt=0, description="用户ID（可选，针对member和merchant积分）"),
+    start_date: Optional[str] = Query(None, description="开始日期 yyyy-MM-dd"),
+    end_date: Optional[str] = Query(None, description="结束日期 yyyy-MM-dd"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """
+    查询所有积分类型的详细流水（用户积分+商家积分+公司积分池）
+
+    整合三类积分流水：
+    - member_points：用户会员积分
+    - merchant_points：商家积分
+    - company_points：公司积分池（平台储备积分）
+
+    支持按用户ID、日期范围筛选，按时间倒序排列
+    """
+    try:
+        data = service.get_all_points_detail_report(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size
+        )
+
+        summary = data['summary']
+        message = f"总积分明细报表查询成功: "
+        message += f"用户积分{summary['member_points']['total_records']}条, "
+        message += f"商家积分{summary['merchant_points']['total_records']}条, "
+        message += f"公司积分{summary['company_points']['total_records']}条, "
+        message += f"合计{summary['grand_total']['total_records']}条记录"
+
+        return ResponseModel(
+            success=True,
+            message=message,
+            data=data
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"查询总积分明细报表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])

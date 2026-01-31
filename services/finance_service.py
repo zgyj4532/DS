@@ -1110,13 +1110,14 @@ class FinanceService:
 
     def distribute_weekly_subsidy(self) -> bool:
         """
-        发放周补贴（修复版：商家积分按20%权重、平台积分按100%权重参与总积分计算，但只给用户发放）
+        发放周补贴（修复版：商家积分按100%权重、平台积分按100%权重参与总积分计算）
 
         关键修复：
         1. 总积分 = 用户积分(100%) + 商家积分(100%) + 平台储备积分(100%)
         2. 但发放对象仅限于持有 member_points > 0 的用户
+        3. 【新增】平台积分池(company_points)按比例发放给用户26（扣除等额积分数值）
         """
-        logger.info("周补贴发放开始（修复版：商家和平台积分参与运算，但不发放）")
+        logger.info("周补贴发放开始（修复版：商家和平台积分参与运算，平台积分单发用户26）")
 
         pool_balance = self.get_account_balance('subsidy_pool')
         if pool_balance <= 0:
@@ -1130,13 +1131,13 @@ class FinanceService:
                 cur.execute("SELECT SUM(COALESCE(member_points, 0)) as total FROM users")
                 total_user_points = Decimal(str(cur.fetchone()['total'] or 0))
 
-                # 2. 商家积分（按20%权重计入，只参与运算，不发放）
+                # 2. 商家积分（全额计入，只参与运算，不发放）
                 cur.execute(
                     "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
                 total_merchant_points = Decimal(str(cur.fetchone()['total'] or 0))
                 weighted_merchant_points = total_merchant_points
 
-                # 3. 平台储备积分（公司积分池，全额计入，只参与运算，不发放）
+                # 3. 平台储备积分（公司积分池，全额计入，发放给用户26）
                 try:
                     cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
                     cp_row = cur.fetchone()
@@ -1231,14 +1232,12 @@ class FinanceService:
                                VALUES (%s, %s, %s, 'member', %s, NULL, NOW())""",
                             (user_id, -points_to_deduct, new_balance, f"周补贴扣减积分（本次积分值:{points_value:.4f}）")
                         )
-
-                        # ====== 将扣除的积分转入公司积分池 ======
-                        self._add_pool_balance(
-                            cur, 'company_points', points_to_deduct,
-                            f"周补贴扣除积分转入 - 用户{user_id}扣除{points_to_deduct:.4f}分",
-                            related_user=user_id
-                        )
-
+                        # ====== 将扣除的积分转入公司积分池(已删除) ======
+                        # self._add_pool_balance(
+                        #     cur, 'company_points', points_to_deduct,
+                        #     f"周补贴扣除积分转入 - 用户{user_id}扣除{points_to_deduct:.4f}分",
+                        #     related_user=user_id
+                        # )
                         # 【关键修复】从 subsidy_pool 扣除发放的 subsidy_amount
                         try:
                             self._add_pool_balance(
@@ -1263,10 +1262,122 @@ class FinanceService:
                         logger.info(
                             f"用户{user_id}: 发放补贴点数{points_to_add:.4f}, "
                             f"扣减积分{points_to_deduct:.4f}, 余额{new_balance:.4f}, "
-                            f"转入公司积分池{points_to_deduct:.4f}"
                         )
 
-                    # 提交事务
+                    # ==================== 新增：平台积分池补贴发放给用户26 ====================
+                    try:
+                        logger.info("开始处理平台积分池(company_points)补贴发放给用户26")
+
+                        # 重新查询平台积分池余额（获取最新值）
+                        cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
+                        cp_current_row = cur.fetchone()
+                        company_points_current = Decimal(
+                            str(cp_current_row['balance'] or 0)) if cp_current_row else Decimal('0')
+
+                        if company_points_current <= 0:
+                            logger.info("平台积分池余额为0，跳过用户26的特殊发放")
+                        else:
+                            # 计算发放金额（company_points × 积分值），就像普通用户的积分一样计算
+                            platform_subsidy_amount = company_points_current * points_value
+
+                            if platform_subsidy_amount <= Decimal('0'):
+                                logger.info("计算发放金额为0，跳过用户26发放")
+                            else:
+                                # 【关键逻辑】扣除的积分数值 = 发放的点数数值（和用户逻辑一致）
+                                company_points_to_deduct = platform_subsidy_amount
+
+                                # 检查补贴池余额是否充足（平台积分发放也需要从补贴池扣钱）
+                                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'subsidy_pool'")
+                                subsidy_pool_row = cur.fetchone()
+                                current_subsidy_pool = Decimal(
+                                    str(subsidy_pool_row['balance'] or 0)) if subsidy_pool_row else Decimal('0')
+
+                                if current_subsidy_pool < platform_subsidy_amount:
+                                    logger.error(
+                                        f"补贴池余额不足，无法发放用户26的平台积分补贴。需要¥{platform_subsidy_amount:.4f}，当前¥{current_subsidy_pool:.4f}")
+                                    raise FinanceException("补贴池余额不足，无法完成平台积分补贴发放")
+
+                                # 1. 给用户26发放 subsidy_points 和 true_total_points
+                                cur.execute(
+                                    "UPDATE users SET subsidy_points = COALESCE(subsidy_points, 0) + %s, true_total_points = COALESCE(true_total_points, 0) + %s WHERE id = %s",
+                                    (platform_subsidy_amount, platform_subsidy_amount, 26)
+                                )
+
+                                # 检查用户是否存在
+                                if cur.rowcount == 0:
+                                    logger.error("用户26不存在，无法发放平台积分补贴")
+                                    raise FinanceException("用户26不存在")
+
+                                # 2. 扣减 company_points（平台积分池）- 扣除等额的积分数值（不是全部）
+                                self._add_pool_balance(
+                                    cur, 'company_points', -company_points_to_deduct,
+                                    f"周补贴发放 - 平台积分池发放给用户26，基数{company_points_current:.4f}分，积分值{points_value:.4f}，发放{company_points_to_deduct:.4f}点数，扣除等额积分{company_points_to_deduct:.4f}",
+                                    related_user=26
+                                )
+
+                                # 3. 扣减 subsidy_pool（补贴池资金）- 扣除等值金额
+                                self._add_pool_balance(
+                                    cur, 'subsidy_pool', -platform_subsidy_amount,
+                                    f"周补贴发放 - 平台积分补贴用户26，扣除补贴池资金¥{platform_subsidy_amount:.4f}",
+                                    related_user=26
+                                )
+
+                                # 4. 记录用户26的补贴点数流水（points_log）- 类型为 company 表示平台积分来源
+                                cur.execute(
+                                    "SELECT subsidy_points FROM users WHERE id = %s", (26,)
+                                )
+                                user26_subsidy_balance = Decimal(str(cur.fetchone()['subsidy_points'] or 0))
+
+                                cur.execute(
+                                    """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at) 
+                                       VALUES (%s, %s, %s, 'company', %s, NULL, NOW())""",
+                                    (26, platform_subsidy_amount, user26_subsidy_balance,
+                                     f"平台积分池补贴发放（company_points基数:{company_points_current:.4f} × 积分值:{points_value:.4f} = 发放{platform_subsidy_amount:.4f}点数，扣除积分{company_points_to_deduct:.4f}）")
+                                )
+
+                                # 5. 记录 company_points 的积分变动到 points_log（便于追踪）
+                                try:
+                                    cur.execute(
+                                        "SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
+                                    cp_after_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+
+                                    cur.execute(
+                                        """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at) 
+                                           VALUES (%s, %s, %s, %s, %s, NULL, NOW())""",
+                                        (PLATFORM_MERCHANT_ID, -company_points_to_deduct, cp_after_balance, 'company',
+                                         f"用户26平台积分补贴发放，扣除积分{company_points_to_deduct:.4f}（发放点数等额）")
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"记录平台积分池积分流水失败: {e}")
+
+                                # 6. 记录到 weekly_subsidy_records（标记为平台积分来源）
+                                cur.execute(
+                                    """INSERT INTO weekly_subsidy_records 
+                                       (user_id, week_start, subsidy_amount, points_before, points_deducted, remark)
+                                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                                    (26, today, platform_subsidy_amount, company_points_current,
+                                     company_points_to_deduct,
+                                     f"平台积分池发放（基数{company_points_current:.4f}×积分值{points_value:.4f}，扣除积分{company_points_to_deduct:.4f}）")
+                                )
+
+                                total_distributed += platform_subsidy_amount
+                                logger.info(
+                                    f"【特殊发放】用户26获得平台积分补贴: ¥{platform_subsidy_amount:.4f} "
+                                    f"(company_points: {company_points_current:.4f} × {points_value:.4f})，"
+                                    f"扣除company_points积分: {company_points_to_deduct:.4f}（等额），"
+                                    f"扣除补贴池资金: ¥{platform_subsidy_amount:.4f}"
+                                )
+
+                    except InsufficientBalanceException:
+                        logger.error(f"❌ 用户26平台积分补贴发放失败: 资金池余额不足")
+                        raise FinanceException("平台积分补贴发放失败: 资金池余额不足")
+                    except Exception as e:
+                        logger.error(f"❌ 用户26平台积分补贴发放失败: {e}", exc_info=True)
+                        # 如果需要严格事务，可以取消下面的注释，让错误中断整个发放
+                        # raise
+                    # ===================================================================
+
+                    # 提交事务（包含普通用户发放和用户26的特殊发放）
                     conn.commit()
 
             # 如果设置了 auto_clear=true，发放完成后自动清除手动配置
@@ -1275,7 +1386,8 @@ class FinanceService:
                 self.adjust_subsidy_points_value(None)
 
             logger.info(f"周补贴完成: 发放¥{total_distributed:.4f}等值点数，"
-                        f"扣除积分{total_points_deducted:.4f}分，涉及{len(users)}个用户")
+                        f"扣除用户积分{total_points_deducted:.4f}分 + 平台积分{company_points_to_deduct if 'company_points_to_deduct' in locals() else 0:.4f}分，"
+                        f"涉及{len(users)}个普通用户 + 用户26(平台积分)")
             return True
 
         except InsufficientBalanceException:
@@ -3846,8 +3958,8 @@ class FinanceService:
 
     def get_weekly_subsidy_report(self, year: int, week: int, user_id: Optional[int] = None,
                                   page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """周补贴明细报表（显示发放点数和余额变化）"""
-        logger.info(f"生成周补贴报表: {year}年第{week}周")
+        """周补贴明细报表（适配平台积分池补贴）"""
+        logger.info(f"生成周补贴明细报表: {year}年第{week}周")
 
         from datetime import date, timedelta
 
@@ -3882,28 +3994,46 @@ class FinanceService:
                 cur.execute(count_sql, tuple(params))
                 total_count = cur.fetchone()['total'] or 0
 
-                # 明细查询（增加发放前后余额）
+                # 明细查询（关键修复：将 % 转义为 %%）
                 offset = (page - 1) * page_size
                 detail_sql = f"""
-                    SELECT wsr.user_id, u.name as user_name, wsr.week_start,
-                           wsr.subsidy_amount, wsr.points_before, wsr.points_deducted,
-                           u.subsidy_points as current_subsidy_points,
-                           (u.subsidy_points - wsr.points_deducted) as subsidy_points_before
+                    SELECT 
+                        wsr.id,
+                        wsr.user_id, 
+                        u.name as user_name, 
+                        wsr.week_start,
+                        wsr.subsidy_amount, 
+                        wsr.points_before, 
+                        wsr.points_deducted,
+                        wsr.remark,
+                        u.subsidy_points as current_subsidy_points,
+                        u.member_points as current_member_points,
+                        CASE 
+                            WHEN wsr.user_id = 26 AND wsr.remark LIKE '%%平台积分池%%' THEN 'platform_points'
+                            ELSE 'member_points'
+                        END as distribution_type
                     FROM weekly_subsidy_records wsr
                     JOIN users u ON wsr.user_id = u.id
                     WHERE {where_sql}
-                    ORDER BY wsr.user_id, wsr.week_start DESC
+                    ORDER BY 
+                        wsr.user_id,
+                        wsr.week_start DESC
                     LIMIT %s OFFSET %s
                 """
                 params.extend([page_size, offset])
                 cur.execute(detail_sql, tuple(params))
                 records = cur.fetchall()
 
-                # 汇总统计
+                # 汇总统计（关键修复：将 % 转义为 %%）
                 summary_sql = f"""
-                    SELECT COUNT(DISTINCT wsr.user_id) as total_users,
-                           SUM(wsr.subsidy_amount) as total_subsidy_amount,
-                           SUM(wsr.points_deducted) as total_points_issued
+                    SELECT 
+                        COUNT(DISTINCT wsr.user_id) as total_users,
+                        SUM(wsr.subsidy_amount) as total_subsidy_amount,
+                        SUM(wsr.points_deducted) as total_points_deducted,
+                        SUM(CASE WHEN wsr.user_id = 26 AND wsr.remark LIKE '%%平台积分池%%' 
+                            THEN wsr.subsidy_amount ELSE 0 END) as platform_points_subsidy,
+                        SUM(CASE WHEN NOT (wsr.user_id = 26 AND wsr.remark LIKE '%%平台积分池%%')
+                            THEN wsr.subsidy_amount ELSE 0 END) as regular_subsidy
                     FROM weekly_subsidy_records wsr
                     WHERE {where_sql.replace(' AND wsr.user_id = %s', '') if user_id else where_sql}
                 """
@@ -3913,14 +4043,63 @@ class FinanceService:
                     cur.execute(summary_sql, tuple(params[:-2]))
                 summary = cur.fetchone()
 
+                # 查询平台积分池当前余额
+                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
+                cp_row = cur.fetchone()
+                company_points_balance = float(cp_row['balance'] if cp_row else 0)
+
+                # 格式化返回数据
+                formatted_records = []
+                for r in records:
+                    is_platform = (r['distribution_type'] == 'platform_points')
+
+                    formatted_records.append({
+                        "record_id": r['id'],
+                        "user_id": r['user_id'],
+                        "user_name": r['user_name'],
+                        "week_start": r['week_start'].strftime("%Y-%m-%d"),
+                        "subsidy_amount": float(r['subsidy_amount'] or 0),
+                        "points_issued": float(r['points_deducted'] or 0),
+                        "distribution_type": r['distribution_type'],
+                        "distribution_type_name": "平台积分池补贴" if is_platform else "普通用户补贴",
+                        "points_source": {
+                            "type": "company_points" if is_platform else "member_points",
+                            "name": "平台储备积分" if is_platform else "用户会员积分",
+                            "points_before": float(r['points_before'] or 0),
+                            "points_deducted": float(r['points_deducted'] or 0),
+                            "current_balance": float(
+                                r['current_member_points'] or 0) if not is_platform else company_points_balance
+                        },
+                        "subsidy_points_after": float(r['current_subsidy_points'] or 0),
+                        "remark": r['remark'] if r['remark'] else (
+                            f"{'平台积分池' if is_platform else '用户积分'}补贴发放："
+                            f"基数{float(r['points_before'] or 0):.4f} × 积分值 = "
+                            f"发放{float(r['points_deducted'] or 0):.4f}"
+                        ),
+                        "is_platform_special_user": r['user_id'] == 26
+                    })
+
                 return {
                     "summary": {
+                        "report_type": "weekly_subsidy_with_platform_points",
                         "query_week": f"{year}-W{week:02d}",
                         "week_start": week_start.strftime("%Y-%m-%d"),
                         "week_end": week_end.strftime("%Y-%m-%d"),
                         "total_users": summary['total_users'] or 0,
                         "total_subsidy_amount": float(summary['total_subsidy_amount'] or 0),
-                        "total_points_issued": float(summary['total_points_issued'] or 0)
+                        "total_points_deducted": float(summary['total_points_deducted'] or 0),
+                        "breakdown": {
+                            "regular_subsidy": {
+                                "amount": float(summary['regular_subsidy'] or 0),
+                                "description": "普通用户补贴（基于member_points）"
+                            },
+                            "platform_points_subsidy": {
+                                "amount": float(summary['platform_points_subsidy'] or 0),
+                                "description": "平台积分池补贴（用户26，基于company_points）"
+                            }
+                        },
+                        "company_points_balance": company_points_balance,
+                        "remark": "平台积分池补贴发放给用户26，扣除等额company_points积分"
                     },
                     "pagination": {
                         "page": page,
@@ -3928,55 +4107,28 @@ class FinanceService:
                         "total": total_count,
                         "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
                     },
-                    "records": [
-                        {
-                            "user_id": r['user_id'],
-                            "user_name": r['user_name'],
-                            "week_start": r['week_start'].strftime("%Y-%m-%d"),
-                            "subsidy_amount": float(r['subsidy_amount'] or 0),
-                            "points_issued": float(r['points_deducted'] or 0),  # 实际发放点数
-                            "member_points_before": float(r['points_before'] or 0),  # 参与计算的积分
-                            "subsidy_points_before": float(r['subsidy_points_before'] or 0),  # 发放前余额
-                            "subsidy_points_after": float(r['current_subsidy_points'] or 0),  # 发放后余额
-                            "remark": f"发放补贴点数{float(r['points_deducted'] or 0):.4f}，扣减积分{float(r['points_before'] or 0):.4f}"
-                        } for r in records
-                    ],
-                    "points_flow": {
-                        "source_field": "member_points",
-                        "target_field": "subsidy_points",
-                        "action": "积分兑换补贴点数"
+                    "records": formatted_records,
+                    "calculation_logic": {
+                        "regular_user": "补贴点数 = member_points × 积分值，同时扣减等额member_points",
+                        "platform_user": "用户26补贴 = company_points × 积分值，同时扣减等额company_points",
+                        "funding_source": "所有补贴均从subsidy_pool资金池扣除等额资金"
                     }
                 }
 
     def get_monthly_subsidy_report(self, year: int, month: int, user_id: Optional[int] = None,
                                    page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """月补贴明细报表
-
-        查询指定年月的补贴发放明细（按周汇总）
-
-        Args:
-            year: 年份，如2025
-            month: 月份，1-12
-            user_id: 用户ID（可选）
-            page: 页码
-            page_size: 每页条数
-
-        Returns:
-            包含汇总、分页和明细的字典
-        """
-        logger.info(f"生成月补贴报表: {year}年{month}月")
+        """月补贴明细报表（同步适配平台积分池补贴）"""
+        logger.info(f"生成月补贴明细报表: {year}年{month}月")
 
         from datetime import date
         import calendar
 
-        # 计算月的开始和结束日期
         _, last_day = calendar.monthrange(year, month)
         month_start = date(year, month, 1)
         month_end = date(year, month, last_day)
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 构建WHERE条件
                 where_conditions = ["wsr.week_start BETWEEN %s AND %s"]
                 params = [month_start, month_end]
 
@@ -3986,36 +4138,46 @@ class FinanceService:
 
                 where_sql = " AND ".join(where_conditions)
 
-                # 总记录数查询
-                count_sql = f"""
-                    SELECT COUNT(*) as total 
-                    FROM weekly_subsidy_records wsr 
-                    WHERE {where_sql}
-                """
+                count_sql = f"SELECT COUNT(*) as total FROM weekly_subsidy_records wsr WHERE {where_sql}"
                 cur.execute(count_sql, tuple(params))
                 total_count = cur.fetchone()['total'] or 0
 
-                # 明细查询
                 offset = (page - 1) * page_size
+                # 关键修复：将 % 转义为 %%
                 detail_sql = f"""
-                    SELECT wsr.user_id, u.name as user_name, wsr.week_start,
-                           wsr.subsidy_amount, wsr.points_before, wsr.points_deducted,
-                           wsr.coupon_id
+                    SELECT 
+                        wsr.id,
+                        wsr.user_id, 
+                        u.name as user_name, 
+                        wsr.week_start,
+                        wsr.subsidy_amount, 
+                        wsr.points_before, 
+                        wsr.points_deducted,
+                        wsr.remark,
+                        CASE 
+                            WHEN wsr.user_id = 26 AND wsr.remark LIKE '%%平台积分池%%' THEN 'platform_points'
+                            ELSE 'member_points'
+                        END as distribution_type
                     FROM weekly_subsidy_records wsr
                     JOIN users u ON wsr.user_id = u.id
                     WHERE {where_sql}
-                    ORDER BY wsr.user_id, wsr.week_start DESC
+                    ORDER BY wsr.week_start DESC, wsr.user_id
                     LIMIT %s OFFSET %s
                 """
                 params.extend([page_size, offset])
                 cur.execute(detail_sql, tuple(params))
                 records = cur.fetchall()
 
-                # 汇总统计
+                # 关键修复：将 % 转义为 %%
                 summary_sql = f"""
-                    SELECT COUNT(DISTINCT wsr.user_id) as total_users,
-                           SUM(wsr.subsidy_amount) as total_subsidy_amount,
-                           SUM(wsr.points_deducted) as total_points_deducted
+                    SELECT 
+                        COUNT(DISTINCT wsr.user_id) as total_users,
+                        SUM(wsr.subsidy_amount) as total_subsidy_amount,
+                        SUM(wsr.points_deducted) as total_points_deducted,
+                        SUM(CASE WHEN wsr.user_id = 26 AND wsr.remark LIKE '%%平台积分池%%' 
+                            THEN wsr.subsidy_amount ELSE 0 END) as platform_points_subsidy,
+                        SUM(CASE WHEN NOT (wsr.user_id = 26 AND wsr.remark LIKE '%%平台积分池%%')
+                            THEN wsr.subsidy_amount ELSE 0 END) as regular_subsidy
                     FROM weekly_subsidy_records wsr
                     WHERE {where_sql.replace(' AND wsr.user_id = %s', '') if user_id else where_sql}
                 """
@@ -4027,12 +4189,17 @@ class FinanceService:
 
                 return {
                     "summary": {
+                        "report_type": "monthly_subsidy_with_platform_points",
                         "query_month": f"{year}-{month:02d}",
                         "month_start": month_start.strftime("%Y-%m-%d"),
                         "month_end": month_end.strftime("%Y-%m-%d"),
                         "total_users": summary['total_users'] or 0,
                         "total_subsidy_amount": float(summary['total_subsidy_amount'] or 0),
-                        "total_points_deducted": float(summary['total_points_deducted'] or 0)
+                        "total_points_deducted": float(summary['total_points_deducted'] or 0),
+                        "breakdown": {
+                            "regular_subsidy": float(summary['regular_subsidy'] or 0),
+                            "platform_points_subsidy": float(summary['platform_points_subsidy'] or 0)
+                        }
                     },
                     "pagination": {
                         "page": page,
@@ -4042,15 +4209,16 @@ class FinanceService:
                     },
                     "records": [
                         {
+                            "record_id": r['id'],
                             "user_id": r['user_id'],
                             "user_name": r['user_name'],
                             "week_start": r['week_start'].strftime("%Y-%m-%d"),
                             "subsidy_amount": float(r['subsidy_amount'] or 0),
-                            "points_before": float(r['points_before'] or 0),
                             "points_deducted": float(r['points_deducted'] or 0),
-                            "points_after": float((r['points_before'] or 0) - (r['points_deducted'] or 0)),
-                            "coupon_id": r['coupon_id'],
-                            "remark": f"发放补贴¥{float(r['subsidy_amount'] or 0):.2f}，扣减积分{float(r['points_deducted'] or 0):.4f}"
+                            "distribution_type": r['distribution_type'],
+                            "distribution_type_name": "平台积分池补贴" if r[
+                                                                              'distribution_type'] == 'platform_points' else "普通用户补贴",
+                            "remark": r['remark']
                         } for r in records
                     ]
                 }
@@ -4473,7 +4641,7 @@ class FinanceService:
                 }
 
     def get_weekly_subsidy_preview(self, year: int, week: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """周补贴预览报表（全用户）"""
+        """周补贴预览报表（全用户，包含用户26平台积分池特殊发放预览）"""
         logger.info(f"生成全用户周补贴预览报表: {year}年第{week}周，页码={page}")
 
         from datetime import date, timedelta
@@ -4514,7 +4682,7 @@ class FinanceService:
                 else:
                     total_merchant_points = Decimal('0')
 
-                # 公司积分池
+                # 公司积分池（平台积分）
                 cur.execute("SELECT balance as total FROM finance_accounts WHERE account_type = 'company_points'")
                 row = cur.fetchone()
                 company_points = Decimal(str(row.get('total', 0) or 0))
@@ -4538,6 +4706,58 @@ class FinanceService:
                         points_value = MAX_POINTS_VALUE
                     is_manual_adjusted = False
 
+                # ==================== 新增：用户26平台积分池特殊发放预览 ====================
+                # 查询用户26当前信息
+                cur.execute(
+                    "SELECT id, name, subsidy_points FROM users WHERE id = 26"
+                )
+                user26_info = cur.fetchone()
+
+                # 计算用户26的预估补贴金额
+                user26_preview = None
+                if company_points > 0 and user26_info:
+                    # 计算平台积分补贴金额（与发放逻辑一致）
+                    platform_subsidy_amount = company_points * points_value
+
+                    # 检查补贴池余额是否充足
+                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'subsidy_pool'")
+                    subsidy_pool_row = cur.fetchone()
+                    current_subsidy_pool = Decimal(
+                        str(subsidy_pool_row['balance'] or 0)) if subsidy_pool_row else Decimal('0')
+
+                    can_distribute = current_subsidy_pool >= platform_subsidy_amount
+
+                    user26_preview = {
+                        "user_id": 26,
+                        "user_name": user26_info.get('name', '用户26'),
+                        "current_subsidy_points": float(user26_info.get('subsidy_points', 0) or 0),
+                        "company_points_base": float(company_points),  # 平台积分池基数
+                        "points_value": float(points_value),
+                        "estimated_subsidy_amount": float(platform_subsidy_amount),  # 预估发放金额
+                        "estimated_points_deducted": float(platform_subsidy_amount),  # 预估扣除积分数值（等额）
+                        "subsidy_pool_balance": float(current_subsidy_pool),
+                        "can_distribute": can_distribute,  # 补贴池余额是否充足
+                        "warning": None if can_distribute else f"补贴池余额不足（需要¥{platform_subsidy_amount:.4f}，当前¥{current_subsidy_pool:.4f}）",
+                        "remark": f"平台积分池补贴发放（company_points基数:{company_points:.4f} × 积分值:{points_value:.4f} = 发放{platform_subsidy_amount:.4f}点数，扣除积分{platform_subsidy_amount:.4f}）"
+                    }
+                elif not user26_info:
+                    user26_preview = {
+                        "user_id": 26,
+                        "user_name": "用户26（不存在）",
+                        "error": "用户26不存在，无法发放平台积分补贴",
+                        "company_points_base": float(company_points),
+                        "estimated_subsidy_amount": 0.0
+                    }
+                else:
+                    user26_preview = {
+                        "user_id": 26,
+                        "user_name": user26_info.get('name', '用户26') if user26_info else "用户26",
+                        "company_points_base": 0.0,
+                        "estimated_subsidy_amount": 0.0,
+                        "remark": "平台积分池余额为0，跳过用户26发放"
+                    }
+                # ===================================================================
+
                 # 4. 查询所有有积分的用户（分页）
                 offset = (page - 1) * page_size
 
@@ -4558,9 +4778,12 @@ class FinanceService:
 
                 # 5. 计算每个用户的预计补贴
                 user_records = []
+                total_estimated_subsidy = Decimal('0')  # 追踪总预估补贴金额
+
                 for user in users:
                     user_points = Decimal(str(user.get('member_points') or 0))
                     estimated_coupon = user_points * points_value
+                    total_estimated_subsidy += estimated_coupon
 
                     user_records.append({
                         "user_id": user['id'],
@@ -4570,7 +4793,11 @@ class FinanceService:
                         "points_percentage": float(user_points / total_points * 100) if total_points > 0 else 0.0
                     })
 
-                logger.info(f"全用户周补贴预览生成完成: 共{len(user_records)}条记录")
+                # 累加用户26的预估补贴（如果可发放）
+                if user26_preview and user26_preview.get('can_distribute'):
+                    total_estimated_subsidy += Decimal(str(user26_preview['estimated_subsidy_amount']))
+
+                logger.info(f"全用户周补贴预览生成完成: 共{len(user_records)}条普通用户记录 + 用户26平台积分发放预览")
 
                 return {
                     "summary": {
@@ -4583,7 +4810,8 @@ class FinanceService:
                         "total_system_points": float(total_points),
                         "points_value_per_point": float(points_value),
                         "max_points_value_applied": points_value >= MAX_POINTS_VALUE,
-                        "is_manual_adjusted": is_manual_adjusted  # 新增：是否手动调整
+                        "is_manual_adjusted": is_manual_adjusted,
+                        "total_estimated_subsidy": float(total_estimated_subsidy)  # 新增：总预估补贴金额
                     },
                     "pagination": {
                         "page": page,
@@ -4594,10 +4822,12 @@ class FinanceService:
                     "calculation_details": {
                         "total_user_points": float(total_user_points),
                         "total_merchant_points": float(total_merchant_points),
-                        "company_points": float(company_points)
+                        "company_points": float(company_points),
+                        "platform_points_total": float(total_points)
                     },
+                    "user26_special_distribution": user26_preview,  # 新增：用户26特殊发放预览
                     "user_records": user_records,
-                    "remark": "按member_points降序排列，支持分页查询"
+                    "remark": f"按member_points降序排列，支持分页查询。用户26为平台积分池(company_points)特殊发放对象，发放点数=company_points×积分值，同时扣除等额company_points积分。"
                 }
 
 
@@ -6039,6 +6269,293 @@ class FinanceService:
                     return name
         except Exception:
             return f"查询失败:{user_id}"
+
+    # ==================== 总积分明细报表（包含member/merchant/company三种积分） ====================
+    def get_all_points_detail_report(self,
+                                     user_id: Optional[int] = None,
+                                     start_date: Optional[str] = None,
+                                     end_date: Optional[str] = None,
+                                     page: int = 1,
+                                     page_size: int = 20) -> Dict[str, Any]:
+        """
+        总积分明细报表（包含用户积分、商家积分、公司积分池）
+
+        整合三类积分流水，提供总余额合计
+        """
+        logger.info(f"生成总积分明细报表: 用户={user_id or '所有用户'}, 日期范围={start_date}至{end_date}")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # ==================== 1. 查询 member_points 流水 ====================
+                member_where = ["pl.type = 'member'"]
+                member_params = []
+
+                if user_id:
+                    member_where.append("pl.user_id = %s")
+                    member_params.append(user_id)
+                if start_date:
+                    member_where.append("DATE(pl.created_at) >= %s")
+                    member_params.append(start_date)
+                if end_date:
+                    member_where.append("DATE(pl.created_at) <= %s")
+                    member_params.append(end_date)
+
+                member_sql = f"""
+                    SELECT 
+                        pl.id as flow_id,
+                        pl.user_id,
+                        u.name as user_name,
+                        pl.change_amount,
+                        pl.balance_after,
+                        pl.reason as remark,
+                        pl.created_at,
+                        'member_points' as points_type
+                    FROM points_log pl
+                    JOIN users u ON pl.user_id = u.id
+                    WHERE {" AND ".join(member_where)}
+                """
+
+                # ==================== 2. 查询 merchant_points 流水 ====================
+                merchant_where = ["pl.type = 'merchant'"]
+                merchant_params = []
+
+                if user_id:
+                    merchant_where.append("pl.user_id = %s")
+                    merchant_params.append(user_id)
+                if start_date:
+                    merchant_where.append("DATE(pl.created_at) >= %s")
+                    merchant_params.append(start_date)
+                if end_date:
+                    merchant_where.append("DATE(pl.created_at) <= %s")
+                    merchant_params.append(end_date)
+
+                merchant_sql = f"""
+                    SELECT 
+                        pl.id as flow_id,
+                        pl.user_id,
+                        u.name as user_name,
+                        pl.change_amount,
+                        pl.balance_after,
+                        pl.reason as remark,
+                        pl.created_at,
+                        'merchant_points' as points_type
+                    FROM points_log pl
+                    JOIN users u ON pl.user_id = u.id
+                    WHERE {" AND ".join(merchant_where)}
+                """
+
+                # ==================== 3. 查询 company_points 流水 ====================
+                company_where = ["af.account_type = 'company_points'"]
+                company_params = []
+
+                if user_id:
+                    company_where.append("af.related_user = %s")
+                    company_params.append(user_id)
+                if start_date:
+                    company_where.append("DATE(af.created_at) >= %s")
+                    company_params.append(start_date)
+                if end_date:
+                    company_where.append("DATE(af.created_at) <= %s")
+                    company_params.append(end_date)
+
+                company_sql = f"""
+                    SELECT 
+                        af.id as flow_id,
+                        af.related_user as user_id,
+                        COALESCE(u.name, '平台') as user_name,
+                        af.change_amount,
+                        af.balance_after,
+                        af.remark,
+                        af.created_at,
+                        'company_points' as points_type
+                    FROM account_flow af
+                    LEFT JOIN users u ON af.related_user = u.id
+                    WHERE {" AND ".join(company_where)}
+                """
+
+                # ==================== 4. 合并查询（UNION ALL）====================
+                union_sql = f"""
+                    ({member_sql})
+                    UNION ALL
+                    ({merchant_sql})
+                    UNION ALL
+                    ({company_sql})
+                    ORDER BY created_at DESC
+                """
+
+                # 计算总数
+                count_sql = f"SELECT COUNT(*) as total FROM ({union_sql}) as combined"
+                cur.execute(count_sql, tuple(member_params + merchant_params + company_params))
+                total_count = cur.fetchone()['total'] or 0
+
+                # 分页查询
+                offset = (page - 1) * page_size
+                paged_sql = union_sql + f" LIMIT %s OFFSET %s"
+                all_params = member_params + merchant_params + company_params + [page_size, offset]
+
+                cur.execute(paged_sql, tuple(all_params))
+                records = cur.fetchall()
+
+                # ==================== 5. 汇总统计（各类型分别统计）====================
+                # member 汇总
+                member_count_params = [p for p in [user_id, start_date, end_date] if p]
+                cur.execute(f"""
+                    SELECT 
+                        COUNT(*) as count,
+                        SUM(CASE WHEN change_amount > 0 THEN change_amount ELSE 0 END) as income,
+                        SUM(CASE WHEN change_amount < 0 THEN ABS(change_amount) ELSE 0 END) as expense,
+                        SUM(change_amount) as net_change
+                    FROM points_log pl
+                    WHERE type = 'member' {"AND user_id = %s" if user_id else ""} 
+                    {"AND DATE(created_at) >= %s" if start_date else ""}
+                    {"AND DATE(created_at) <= %s" if end_date else ""}
+                """, tuple(member_count_params))
+                member_summary = cur.fetchone()
+
+                # merchant 汇总
+                cur.execute(f"""
+                    SELECT 
+                        COUNT(*) as count,
+                        SUM(CASE WHEN change_amount > 0 THEN change_amount ELSE 0 END) as income,
+                        SUM(CASE WHEN change_amount < 0 THEN ABS(change_amount) ELSE 0 END) as expense,
+                        SUM(change_amount) as net_change
+                    FROM points_log pl
+                    WHERE type = 'merchant' {"AND user_id = %s" if user_id else ""}
+                    {"AND DATE(created_at) >= %s" if start_date else ""}
+                    {"AND DATE(created_at) <= %s" if end_date else ""}
+                """, tuple(member_count_params))
+                merchant_summary = cur.fetchone()
+
+                # company_points 汇总
+                company_count_params = [p for p in [user_id, start_date, end_date] if p]
+                cur.execute(f"""
+                    SELECT 
+                        COUNT(*) as count,
+                        SUM(CASE WHEN change_amount > 0 THEN change_amount ELSE 0 END) as income,
+                        SUM(CASE WHEN change_amount < 0 THEN ABS(change_amount) ELSE 0 END) as expense,
+                        SUM(change_amount) as net_change
+                    FROM account_flow
+                    WHERE account_type = 'company_points' {"AND related_user = %s" if user_id else ""}
+                    {"AND DATE(created_at) >= %s" if start_date else ""}
+                    {"AND DATE(created_at) <= %s" if end_date else ""}
+                """, tuple(company_count_params))
+                company_summary = cur.fetchone()
+
+                # ==================== 6. 查询当前余额（关键：三种积分余额合计）====================
+                current_balances = {}
+
+                # member_points 当前余额
+                if user_id:
+                    cur.execute("SELECT COALESCE(member_points, 0) as balance FROM users WHERE id = %s", (user_id,))
+                    row = cur.fetchone()
+                    current_balances['member_points'] = float(row['balance'] if row else 0)
+                else:
+                    cur.execute("SELECT COALESCE(SUM(member_points), 0) as balance FROM users")
+                    row = cur.fetchone()
+                    current_balances['member_points'] = float(row['balance'] if row else 0)
+
+                # merchant_points 当前余额
+                if user_id:
+                    cur.execute("SELECT COALESCE(merchant_points, 0) as balance FROM users WHERE id = %s", (user_id,))
+                    row = cur.fetchone()
+                    current_balances['merchant_points'] = float(row['balance'] if row else 0)
+                else:
+                    cur.execute("SELECT COALESCE(SUM(merchant_points), 0) as balance FROM users")
+                    row = cur.fetchone()
+                    current_balances['merchant_points'] = float(row['balance'] if row else 0)
+
+                # company_points 当前余额
+                cur.execute(
+                    "SELECT COALESCE(balance, 0) as balance FROM finance_accounts WHERE account_type = 'company_points'")
+                row = cur.fetchone()
+                current_balances['company_points'] = float(row['balance'] if row else 0)
+
+                # ==================== 7. 格式化返回数据（包含余额合计）====================
+                formatted_records = []
+                for r in records:
+                    flow_type = "收入" if r['change_amount'] > 0 else "支出"
+                    points_type_map = {
+                        'member_points': '用户积分',
+                        'merchant_points': '商家积分',
+                        'company_points': '公司积分池'
+                    }
+
+                    formatted_records.append({
+                        "flow_id": r['flow_id'],
+                        "user_id": r['user_id'],
+                        "user_name": r['user_name'],
+                        "points_type": r['points_type'],
+                        "points_type_name": points_type_map.get(r['points_type'], r['points_type']),
+                        "change_amount": float(r['change_amount'] or 0),
+                        "balance_after": float(r['balance_after'] or 0),
+                        "flow_type": flow_type,
+                        "remark": r['remark'],
+                        "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S") if hasattr(r['created_at'],
+                                                                                               'strftime') else str(
+                            r['created_at'])
+                    })
+
+                # 汇总数据（关键更新：添加总余额合计）
+                total_balance_sum = current_balances['member_points'] + current_balances['merchant_points'] + \
+                                    current_balances['company_points']
+
+                summary_data = {
+                    "member_points": {
+                        "total_records": member_summary['count'] or 0,
+                        "total_income": float(member_summary['income'] or 0),
+                        "total_expense": float(member_summary['expense'] or 0),
+                        "net_change": float(member_summary['net_change'] or 0),
+                        "current_balance": current_balances['member_points']
+                    },
+                    "merchant_points": {
+                        "total_records": merchant_summary['count'] or 0,
+                        "total_income": float(merchant_summary['income'] or 0),
+                        "total_expense": float(merchant_summary['expense'] or 0),
+                        "net_change": float(merchant_summary['net_change'] or 0),
+                        "current_balance": current_balances['merchant_points']
+                    },
+                    "company_points": {
+                        "total_records": company_summary['count'] or 0,
+                        "total_income": float(company_summary['income'] or 0),
+                        "total_expense": float(company_summary['expense'] or 0),
+                        "net_change": float(company_summary['net_change'] or 0),
+                        "current_balance": current_balances['company_points']
+                    },
+                    "grand_total": {
+                        "total_records": (member_summary['count'] or 0) + (merchant_summary['count'] or 0) + (
+                                    company_summary['count'] or 0),
+                        "total_income": float((member_summary['income'] or 0) + (merchant_summary['income'] or 0) + (
+                                    company_summary['income'] or 0)),
+                        "total_expense": float((member_summary['expense'] or 0) + (merchant_summary['expense'] or 0) + (
+                                    company_summary['expense'] or 0)),
+                        "net_change": float(
+                            (member_summary['net_change'] or 0) + (merchant_summary['net_change'] or 0) + (
+                                        company_summary['net_change'] or 0)),
+                        "current_balance_total": total_balance_sum,  # ← 三种积分余额总和
+                        "breakdown": {  # ← 明细构成
+                            "member_points_balance": current_balances['member_points'],
+                            "merchant_points_balance": current_balances['merchant_points'],
+                            "company_points_balance": current_balances['company_points']
+                        }
+                    }
+                }
+
+                return {
+                    "summary": {
+                        "report_type": "all_points_detail",
+                        "query_date_range": f"{start_date or '开始'} 至 {end_date or '结束'}",
+                        "user_filter": user_id or "所有用户",
+                        **summary_data
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": formatted_records,
+                    "remark": "整合用户积分(member_points)、商家积分(merchant_points)和公司积分池(company_points)的完整流水明细，grand_total.current_balance_total为三种积分余额总和，current_balance_total为三种积分余额总和，current_balance_total为三种积分余额总和，current_balance_total为三种积分余额总和"
+                }
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
 def _build_team_rewards_select(cursor, asset_fields: List[str] = None) -> tuple:
