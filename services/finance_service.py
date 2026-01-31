@@ -4724,7 +4724,8 @@ class FinanceService:
                 summary = cur.fetchone()
 
                 # 汇总积分数据
-                total_user_points = total_deducted_points = total_merchant_points = 0
+                total_user_points = total_deducted_points = total_merchant_points = Decimal('0')
+                platform_points = Decimal('0')  # 平台储备积分
                 if order_ids:
                     # 总用户积分
                     cur.execute(f"""
@@ -4733,7 +4734,7 @@ class FinanceService:
                         WHERE type = 'member' AND change_amount > 0
                           AND related_order IN ({placeholders})
                     """, params_tuple)
-                    total_user_points = cur.fetchone()['total_user_points'] or 0
+                    total_user_points = Decimal(str(cur.fetchone()['total_user_points'] or 0))
 
                     # 总抵扣积分
                     cur.execute(f"""
@@ -4742,7 +4743,7 @@ class FinanceService:
                             WHERE type = 'member' AND change_amount < 0
                                 AND related_order IN ({placeholders})
                     """, params_tuple)
-                    total_deducted_points = cur.fetchone()['total_deducted_points'] or 0
+                    total_deducted_points = Decimal(str(cur.fetchone()['total_deducted_points'] or 0))
 
                     # 总商户积分
                     cur.execute(f"""
@@ -4751,7 +4752,17 @@ class FinanceService:
                             WHERE type = 'merchant'
                                 AND related_order IN ({placeholders})
                     """, params_tuple)
-                    total_merchant_points = cur.fetchone()['total_merchant_points'] or 0
+                    total_merchant_points = Decimal(str(cur.fetchone()['total_merchant_points'] or 0))
+
+                # 平台积分（company_points）计入总用户积分
+                try:
+                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
+                    cp_row = cur.fetchone() or {}
+                    platform_points = Decimal(str(cp_row.get('balance', 0) or 0))
+                except Exception as e:
+                    logger.debug(f"查询平台积分失败，忽略: {e}")
+
+                total_user_points_with_platform = total_user_points + platform_points
 
                 # 6. 构建返回数据
                 records = []
@@ -4800,7 +4811,8 @@ class FinanceService:
                         "total_original_amount": float(summary['total_original_amount'] or 0),
                         "total_points_deduction": float(summary['total_points_deduction'] or 0),
                         "total_net_sales": float(summary['total_net_sales'] or 0),
-                        "total_user_points_issued": float(total_user_points),
+                        "total_user_points_issued": float(total_user_points_with_platform),
+                        "platform_points_included": float(platform_points),
                         "total_points_deducted": float(total_deducted_points),
                         "total_merchant_points_issued": float(total_merchant_points),
                         "average_deduction_rate": f"{(summary['total_points_deduction'] or 0) / (summary['total_original_amount'] or 1) * 100:.2f}%"
