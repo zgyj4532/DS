@@ -8,6 +8,7 @@ from .refund import RefundManager
 from .wechat_shipping import WechatShippingManager, WechatShippingService
 from core.logging import get_logger
 import time
+import json  # ==================== 新增：导入json用于记录日志 ====================
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -182,11 +183,13 @@ class MerchantManager:
 
                         logger.info(
                             "微信发货同步参数 | order=%s tracking=%s express=%s item_desc=%s consignee_phone=%s user_name=%s",
-                            order_number, tracking_number, express_company, item_desc, receiver_phone, order_info.get("user_name")
+                            order_number, tracking_number, express_company, item_desc, receiver_phone,
+                            order_info.get("user_name")
                         )
                         logger.info(
                             "微信发货同步参数HEX | tracking=%s express=%s item_desc=%s consignee_phone=%s user_name=%s",
-                            _hex(tracking_number), _hex(express_company), _hex(item_desc), _hex(receiver_phone), _hex(order_info.get("user_name"))
+                            _hex(tracking_number), _hex(express_company), _hex(item_desc), _hex(receiver_phone),
+                            _hex(order_info.get("user_name"))
                         )
 
                         # 同步到微信
@@ -206,15 +209,88 @@ class MerchantManager:
                         if wx_result.get("errcode") == 0:
                             result["message"] += "，已同步到微信发货管理"
                             logger.info(f"订单{order_number}同步到微信发货管理成功")
+
+                            # ==================== 新增：记录成功日志到数据库 ====================
+                            try:
+                                cur.execute("""
+                                    INSERT INTO wechat_shipping_logs 
+                                    (order_id, order_number, transaction_id, action_type, logistics_type, 
+                                     express_company, tracking_no, is_success, response_data, created_at)
+                                    VALUES (%s, %s, %s, 'upload', %s, %s, %s, 1, %s, NOW())
+                                """, (
+                                    order_info['id'],
+                                    order_number,
+                                    transaction_id,
+                                    logistics_type,
+                                    express_company,
+                                    tracking_number,
+                                    json.dumps(wx_result)
+                                ))
+
+                                # 更新订单的微信发货状态为已上传(1)
+                                cur.execute("""
+                                    UPDATE orders 
+                                    SET wechat_shipping_status = 1,
+                                        wechat_shipping_time = NOW(),
+                                        wechat_shipping_msg = NULL
+                                    WHERE id = %s
+                                """, (order_info['id'],))
+                                conn.commit()
+                            except Exception as e:
+                                logger.error(f"记录微信发货成功日志失败: {e}")
+                                conn.rollback()
+
                         else:
                             error_msg = wx_result.get("errmsg", "未知错误")
                             result["message"] += f"，同步到微信失败：{error_msg}"
                             logger.error(f"订单{order_number}同步到微信发货管理失败：{error_msg}")
 
+                            # ==================== 新增：记录失败日志 ====================
+                            try:
+                                cur.execute("""
+                                    INSERT INTO wechat_shipping_logs 
+                                    (order_id, order_number, transaction_id, action_type, logistics_type,
+                                     express_company, tracking_no, is_success, errmsg, response_data, created_at)
+                                    VALUES (%s, %s, %s, 'upload', %s, %s, %s, 0, %s, %s, NOW())
+                                """, (
+                                    order_info['id'],
+                                    order_number,
+                                    transaction_id,
+                                    logistics_type,
+                                    express_company,
+                                    tracking_number,
+                                    error_msg,
+                                    json.dumps(wx_result)
+                                ))
+
+                                # 更新订单的微信发货状态为失败(2)
+                                cur.execute("""
+                                    UPDATE orders 
+                                    SET wechat_shipping_status = 2,
+                                        wechat_shipping_msg = %s
+                                    WHERE id = %s
+                                """, (error_msg[:500], order_info['id']))
+                                conn.commit()
+                            except Exception as e:
+                                logger.error(f"记录微信发货失败日志失败: {e}")
+                                conn.rollback()
+
                     except Exception as e:
                         logger.error(f"同步订单{order_number}到微信发货管理异常: {e}")
                         result["wechat_sync"] = {"error": str(e)}
                         result["message"] += f"，同步到微信异常：{str(e)}"
+
+                        # ==================== 新增：记录异常状态 ====================
+                        try:
+                            cur.execute("""
+                                UPDATE orders 
+                                SET wechat_shipping_status = 2,
+                                    wechat_shipping_msg = %s
+                                WHERE id = %s
+                            """, (str(e)[:500], order_info['id']))
+                            conn.commit()
+                        except:
+                            pass
                 elif sync_to_wechat:
                     missing = []
                     if not transaction_id:

@@ -22,8 +22,12 @@ from io import BytesIO
 from typing import List, Dict, Any
 from fastapi.responses import StreamingResponse
 
+# ==================== 新增：导入微信发货管理模块 ====================
+from .wechat_shipping import WechatShippingManager
+
 logger = get_logger(__name__)
 router = APIRouter()
+
 
 # 在 order.py 的 _cancel_expire_orders 函数中
 def _cancel_expire_orders():
@@ -78,11 +82,136 @@ def _cancel_expire_orders():
             print(f"[expire] error: {e}")
         time.sleep(60)
 
+
 def start_order_expire_task():
     """由 api.order 包初始化时调用一次即可"""
     t = threading.Thread(target=_cancel_expire_orders, daemon=True)
     t.start()
     print("[expire] 订单过期守护线程已启动")
+
+
+# ==================== 新增：定时同步微信订单状态（解决资金结算问题） ====================
+def _sync_wechat_order_status():
+    """
+    定时同步微信订单状态（每30分钟执行一次）
+    解决用户通过微信确认收货组件确认收货后，后端状态未更新的问题
+    """
+    while True:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # 查询已发货(pending_recv)且已同步到微信(wechat_shipping_status=1)的订单
+                    # 且最近1小时内未同步过的订单
+                    cur.execute("""
+                        SELECT id, order_number, transaction_id, status, user_id
+                        FROM orders
+                        WHERE status='pending_recv'
+                          AND wechat_shipping_status = 1
+                          AND transaction_id IS NOT NULL
+                          AND (
+                              wechat_last_sync_time IS NULL 
+                              OR wechat_last_sync_time <= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                          )
+                        LIMIT 50
+                    """)
+
+                    orders = cur.fetchall()
+
+                    for order in orders:
+                        try:
+                            # 查询微信侧的订单状态
+                            wx_result = WechatShippingManager.get_order(order['transaction_id'])
+
+                            # 更新同步时间
+                            cur.execute(
+                                "UPDATE orders SET wechat_last_sync_time = NOW() WHERE id = %s",
+                                (order['id'],)
+                            )
+
+                            if wx_result.get('errcode') == 0:
+                                order_state = wx_result.get('order_state')
+
+                                # 微信状态：1待发货 2已发货 3确认收货 4交易完成 5已退款
+                                if order_state == 3:
+                                    # 用户已确认收货，更新订单状态为已完成
+                                    logger.info(
+                                        f"[wx_sync] 订单 {order['order_number']} 微信状态已确认收货，更新本地状态")
+
+                                    # 更新订单状态
+                                    cur.execute("""
+                                        UPDATE orders 
+                                        SET status='completed', 
+                                            completed_at=NOW(),
+                                            updated_at=NOW()
+                                        WHERE id=%s
+                                    """, (order['id'],))
+
+                                    # 记录日志
+                                    cur.execute("""
+                                        INSERT INTO wechat_shipping_logs 
+                                        (order_id, order_number, transaction_id, action_type, is_success, response_data, created_at)
+                                        VALUES (%s, %s, %s, 'sync', 1, %s, NOW())
+                                    """, (
+                                        order['id'],
+                                        order['order_number'],
+                                        order['transaction_id'],
+                                        json.dumps(wx_result)
+                                    ))
+
+                                    # 可选：触发资金结算（如果之前未结算）
+                                    try:
+                                        fs = FinanceService()
+                                        # 这里可以调用资金结算逻辑，如果之前未在支付时结算的话
+                                        # 注意：根据业务逻辑，资金可能已经在支付时拆分，这里只是更新状态
+                                    except Exception as e:
+                                        logger.error(f"[wx_sync] 订单 {order['order_number']} 资金结算异常: {e}")
+
+                                    conn.commit()
+                                    logger.info(f"[wx_sync] 订单 {order['order_number']} 状态已同步为完成")
+
+                                elif order_state == 4:
+                                    # 交易完成（可能已过确认收货期）
+                                    cur.execute("""
+                                        UPDATE orders 
+                                        SET status='completed', 
+                                            completed_at=NOW(),
+                                            updated_at=NOW()
+                                        WHERE id=%s
+                                    """, (order['id'],))
+                                    conn.commit()
+
+                            else:
+                                # 查询失败记录日志
+                                logger.warning(
+                                    f"[wx_sync] 查询订单 {order['order_number']} 微信状态失败: {wx_result.get('errmsg')}")
+                                cur.execute("""
+                                    INSERT INTO wechat_shipping_logs 
+                                    (order_id, order_number, transaction_id, action_type, is_success, response_data, created_at)
+                                    VALUES (%s, %s, %s, 'sync', 0, %s, NOW())
+                                """, (
+                                    order['id'],
+                                    order['order_number'],
+                                    order['transaction_id'],
+                                    json.dumps(wx_result)
+                                ))
+                                conn.commit()
+
+                        except Exception as e:
+                            logger.error(f"[wx_sync] 同步订单 {order['order_number']} 状态异常: {e}", exc_info=True)
+                            conn.rollback()
+
+        except Exception as e:
+            logger.error(f"[wx_sync] 定时同步任务异常: {e}", exc_info=True)
+
+        time.sleep(1800)  # 30分钟执行一次
+
+
+def start_wechat_status_sync_task():
+    """启动微信订单状态同步守护线程"""
+    t = threading.Thread(target=_sync_wechat_order_status, daemon=True)
+    t.start()
+    logger.info("[wx_sync] 微信订单状态同步守护线程已启动（每30分钟同步一次）")
+
 
 class OrderManager:
     @staticmethod
@@ -121,15 +250,18 @@ class OrderManager:
 
                         sku_id = it.get("sku_id")
                         if not sku_id:
-                            cur.execute("SELECT id FROM product_skus WHERE product_id = %s LIMIT 1", (it['product_id'],))
+                            cur.execute("SELECT id FROM product_skus WHERE product_id = %s LIMIT 1",
+                                        (it['product_id'],))
                             sku_row = cur.fetchone()
                             if sku_row:
                                 sku_id = sku_row.get('id')
                             else:
-                                raise HTTPException(status_code=422, detail=f"商品 {it['product_id']} 无可用 SKU，请提供 sku_id")
+                                raise HTTPException(status_code=422,
+                                                    detail=f"商品 {it['product_id']} 无可用 SKU，请提供 sku_id")
 
                         if "price" not in it:
-                            raise HTTPException(status_code=422, detail=f"buy_now_items 必须包含 price 字段：product_id={it['product_id']}")
+                            raise HTTPException(status_code=422,
+                                                detail=f"buy_now_items 必须包含 price 字段：product_id={it['product_id']}")
 
                         items.append({
                             "sku_id": sku_id,
@@ -203,7 +335,8 @@ class OrderManager:
                 ) if has_stock_field else "0 AS stock"
 
                 for i in items:
-                    cur.execute(f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE id=%s", (i['sku_id'],))
+                    cur.execute(f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE id=%s",
+                                (i['sku_id'],))
                     result = cur.fetchone()
                     current_stock = result.get('stock', 0) if result else 0
                     if current_stock < i["quantity"]:
@@ -222,7 +355,8 @@ class OrderManager:
                 # ---------- 6. 扣库存 ----------
                 if has_stock_field:
                     for i in items:
-                        cur.execute("UPDATE product_skus SET stock = stock - %s WHERE id = %s", (i["quantity"], i["sku_id"]))
+                        cur.execute("UPDATE product_skus SET stock = stock - %s WHERE id = %s",
+                                    (i["quantity"], i['sku_id']))
 
                 # ---------- 7. 清空购物车（仅购物车结算场景） ----------
                 if not buy_now:
@@ -326,6 +460,7 @@ class OrderManager:
     def update_status(order_number: str, new_status: str, reason: Optional[str] = None,
                       external_conn=None) -> bool:
         """统一的订单状态更新，支持外部连接复用。"""
+
         def _apply_update(cur) -> bool:
             cur.execute("SHOW COLUMNS FROM orders")
             cols = {row.get("Field") for row in cur.fetchall()}
@@ -364,6 +499,132 @@ class OrderManager:
                     updated = _apply_update(cur)
                     conn.commit()
                     return updated
+
+    # ==================== 新增：确认收货处理（前端调用微信组件后回调） ====================
+    @staticmethod
+    def confirm_receive(order_number: str, user_id: Optional[int] = None,
+                        wx_confirm_result: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        用户确认收货（前端调用微信确认收货组件成功后回调）
+
+        重要：必须通过微信组件完成确认，否则资金无法结算！
+
+        流程：
+        1. 验证订单状态（必须为 pending_recv）
+        2. 【强制】验证微信侧状态必须为已确认收货(order_state=3)或交易完成(4)
+        3. 更新订单状态为 completed
+        4. 触发资金结算（如果适用）
+        """
+        result = {
+            "ok": False,
+            "message": "",
+            "wx_verified": False
+        }
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 查询订单信息
+                cur.execute(
+                    """SELECT id, user_id, status, transaction_id, order_number, total_amount
+                       FROM orders WHERE order_number=%s""",
+                    (order_number,)
+                )
+                order = cur.fetchone()
+
+                if not order:
+                    result["message"] = "订单不存在"
+                    return result
+
+                # 验证用户权限（如果提供了user_id）
+                if user_id and order['user_id'] != user_id:
+                    result["message"] = "无权操作该订单"
+                    return result
+
+                if order['status'] != 'pending_recv':
+                    result["message"] = f"订单状态不正确，当前状态：{order['status']}"
+                    return result
+
+                # 2. 【强制验证】必须存在微信支付单号
+                transaction_id = order.get('transaction_id')
+                if not transaction_id:
+                    result["message"] = "缺少微信支付单号，无法确认收货"
+                    return result
+
+                # 3. 【核心修改】强制查询微信侧状态，必须为已确认收货
+                try:
+                    wx_result = WechatShippingManager.get_order(transaction_id)
+
+                    if wx_result.get('errcode') != 0:
+                        error_msg = wx_result.get('errmsg', '未知错误')
+                        result["message"] = f"查询微信订单状态失败：{error_msg}"
+                        return result
+
+                    order_state = wx_result.get('order_state')
+
+                    # 严格校验：微信状态必须是 3(确认收货) 或 4(交易完成)
+                    if order_state == 3:
+                        result["wx_verified"] = True
+                        verify_msg = "微信已确认收货"
+                    elif order_state == 4:
+                        result["wx_verified"] = True
+                        verify_msg = "微信交易已完成"
+                    else:
+                        # 状态不对，直接拒绝！
+                        state_map = {1: "待发货", 2: "已发货未收货", 5: "已退款", 6: "资金待结算"}
+                        current_state_name = state_map.get(order_state, f"未知状态({order_state})")
+                        result[
+                            "message"] = f"微信端未确认收货，当前状态：{current_state_name}。请用户在微信小程序内点击确认收货按钮。"
+                        return result
+
+                except Exception as e:
+                    logger.error(f"[confirm_receive] 查询微信状态异常: {e}")
+                    result["message"] = "校验微信收货状态失败，请稍后重试"
+                    return result
+
+                # 4. （可选）验证前端传来的微信组件结果与后台查询是否一致
+                if wx_confirm_result and wx_confirm_result.get('order_id') != transaction_id:
+                    logger.warning(f"[confirm_receive] 前端传入的transaction_id与订单不符")
+                    result["message"] = "验证失败：订单信息不匹配"
+                    return result
+
+                # 5. 更新订单状态
+                updated = OrderManager.update_status(
+                    order_number,
+                    "completed",
+                    f"用户确认收货({verify_msg})",
+                    external_conn=conn
+                )
+
+                if not updated:
+                    result["message"] = "更新订单状态失败"
+                    return result
+
+                # 6. 记录确认收货日志
+                cur.execute("""
+                    INSERT INTO wechat_shipping_logs 
+                    (order_id, order_number, transaction_id, action_type, is_success, remark, response_data, created_at)
+                    VALUES (%s, %s, %s, 'confirm', 1, %s, %s, NOW())
+                """, (
+                    order['id'],
+                    order_number,
+                    transaction_id,
+                    f"用户确认收货, 微信验证: {result['wx_verified']}",
+                    json.dumps(wx_result)
+                ))
+
+                conn.commit()
+
+                result["ok"] = True
+                result["message"] = f"确认收货成功（{verify_msg}），资金将在微信侧结算"
+
+                # 7. 触发后续业务逻辑（如积分发放等）
+                try:
+                    # 如果积分是在确认收货时发放（而非支付时），在这里触发
+                    pass
+                except Exception as e:
+                    logger.error(f"[confirm_receive] 订单 {order_number} 后续处理异常: {e}")
+
+                return result
 
     @staticmethod
     def export_to_excel(order_numbers: List[str]) -> bytes:
@@ -589,6 +850,8 @@ class OrderManager:
         wb.save(excel_data)
         excel_data.seek(0)
         return excel_data.getvalue()
+
+
 # ---------------- 请求模型 ----------------
 class DeliveryWay(str, Enum):
     platform = "platform"  # 平台配送
@@ -617,6 +880,7 @@ class StatusUpdate(BaseModel):
     new_status: str
     reason: Optional[str] = None
 
+
 class WechatPayParams(BaseModel):
     appId: str
     timeStamp: str
@@ -624,6 +888,13 @@ class WechatPayParams(BaseModel):
     package: str
     signType: str
     paySign: str
+
+
+# ==================== 新增：确认收货请求模型（修改后） ====================
+class ConfirmReceiveRequest(BaseModel):
+    order_number: str
+    # 可选：微信组件返回的确认结果（用于增强验证）
+    wx_confirm_result: Optional[Dict[str, Any]] = None
 
 
 # ---------------- 路由 ----------------
@@ -647,6 +918,7 @@ def create_order(body: OrderCreate):
 def list_orders(user_id: int, status: Optional[str] = None):
     return OrderManager.list_by_user(user_id, status)
 
+
 @router.get("/detail/{order_number}", summary="查询订单详情")
 def order_detail(order_number: str):
     d = OrderManager.detail(order_number)
@@ -654,9 +926,45 @@ def order_detail(order_number: str):
         raise HTTPException(status_code=404, detail="订单不存在")
     return d
 
+
 @router.post("/status", summary="更新订单状态")
 def update_status(body: StatusUpdate):
     return {"ok": OrderManager.update_status(body.order_number, body.new_status, body.reason)}
+
+
+# ==================== 新增：确认收货接口（前端调用微信组件后回调） ====================
+@router.post("/confirm-receive", summary="用户确认收货（微信组件回调）")
+def confirm_receive(body: ConfirmReceiveRequest):
+    """
+    用户确认收货接口
+
+    调用时机：前端调用微信确认收货组件(wx.confirmOrderReceiption)成功后回调
+
+    **重要**：必须通过微信组件完成确认，否则资金无法结算！
+
+    前置条件：
+    1. 订单状态必须为 pending_recv（已发货待收货）
+    2. 【强制】微信侧订单状态必须为已确认收货或交易完成
+
+    业务流程：
+    1. 验证订单状态和权限
+    2. 强制查询微信侧状态（必须为3或4）
+    3. 更新订单状态为 completed（已完成）
+    4. 触发资金结算（如果在支付时未结算）
+
+    失败情况：
+    - 如果微信侧未确认收货，会返回错误，前端应引导用户去小程序订单列表确认收货
+    """
+    result = OrderManager.confirm_receive(
+        body.order_number,
+        wx_confirm_result=body.wx_confirm_result
+    )
+
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+
+    return result
+
 
 def auto_receive_task(db_cfg: dict = None):
     """自动收货守护进程（不再发放积分）"""
@@ -704,14 +1012,13 @@ def auto_receive_task(db_cfg: dict = None):
     logger.info("自动收货守护进程已启动（不再发放积分）")
 
 
-
-
 class OrderExportRequest(BaseModel):
     order_numbers: List[str]
 
+
 class OrderExportByTimeRequest(BaseModel):
     start_time: str  # 格式：2025-01-01 00:00:00
-    end_time: str    # 格式：2025-01-31 23:59:59
+    end_time: str  # 格式：2025-01-31 23:59:59
     status: Optional[str] = None  # 可选：按订单状态筛选（如 pending_ship, completed 等）
 
 
@@ -830,5 +1137,8 @@ def export_orders_by_time(body: OrderExportByTimeRequest):
         logger.error(f"按时间导出订单失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
 
-# 模块被导入时自动启动守护线程
+
+# ==================== 修改：模块导入时启动新增的后台任务 ====================
 start_order_expire_task()
+# 新增：启动微信状态同步任务
+start_wechat_status_sync_task()
