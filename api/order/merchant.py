@@ -105,6 +105,10 @@ class MerchantManager:
                 openid = order_info.get("openid")
                 delivery_way = order_info.get("delivery_way", "platform")
 
+                # 如未传入物流单号，回落到订单已存的 tracking_number
+                if not tracking_number:
+                    tracking_number = order_info.get("tracking_number", "")
+
                 # 2. 更新本地订单状态
                 cur.execute(
                     "UPDATE orders SET status='pending_recv', tracking_number=%s "
@@ -130,6 +134,23 @@ class MerchantManager:
                         if logistics_type is None:
                             logistics_type = WechatShippingService.get_logistics_type(delivery_way)
 
+                        # 实体物流缺省时兜底一个快递编码（express_company 与 tracking_no 为必填）
+                        if logistics_type == 1:
+                            if not express_company:
+                                express_company = "YTO"  # 默认圆通，避免空值导致微信拒绝
+                                logger.info("订单%s实体物流未传快递公司，已兜底为 YTO", order_number)
+                            else:
+                                express_company = express_company.strip().upper()
+
+                            # 校验运单号基本格式（微信通常要求 6-32 位字母数字）
+                            tracking_trimmed = (tracking_number or "").strip()
+                            if not tracking_trimmed or len(tracking_trimmed) < 6 or len(tracking_trimmed) > 32:
+                                result["ok"] = False
+                                result["message"] += "，物流单号长度不符合要求(6-32位)"
+                                logger.warning("订单%s物流单号格式不合法: %s", order_number, tracking_trimmed)
+                                return result
+                            tracking_number = tracking_trimmed
+
                         # 构建商品描述
                         if not item_desc:
                             # 查询首个商品名称
@@ -149,6 +170,25 @@ class MerchantManager:
                         # 判断是否为顺丰（需要特殊处理联系方式）
                         is_sfeng = express_company and express_company.upper() in ['SF', 'SFEXPRESS', '顺丰']
 
+                        # 收件人手机号优先使用订单收货人，缺省时回落到用户手机号
+                        receiver_phone = order_info.get("consignee_phone") or order_info.get("user_phone")
+
+                        # 记录即将同步的关键信息（含十六进制视图，便于定位非UTF-8字符）
+                        def _hex(v: Any) -> str:
+                            try:
+                                return str(v).encode("utf-8", "backslashreplace").hex()
+                            except Exception:
+                                return "encode_error"
+
+                        logger.info(
+                            "微信发货同步参数 | order=%s tracking=%s express=%s item_desc=%s consignee_phone=%s user_name=%s",
+                            order_number, tracking_number, express_company, item_desc, receiver_phone, order_info.get("user_name")
+                        )
+                        logger.info(
+                            "微信发货同步参数HEX | tracking=%s express=%s item_desc=%s consignee_phone=%s user_name=%s",
+                            _hex(tracking_number), _hex(express_company), _hex(item_desc), _hex(receiver_phone), _hex(order_info.get("user_name"))
+                        )
+
                         # 同步到微信
                         wx_result = WechatShippingService.sync_order_to_wechat(
                             transaction_id=transaction_id,
@@ -157,7 +197,7 @@ class MerchantManager:
                             tracking_number=tracking_number,
                             express_company=express_company,
                             item_desc=item_desc,
-                            receiver_phone=order_info.get("consignee_phone"),
+                            receiver_phone=receiver_phone,
                             is_sfeng=is_sfeng
                         )
 
