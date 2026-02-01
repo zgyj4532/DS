@@ -128,8 +128,16 @@ def _sync_wechat_order_status():
                                 (order['id'],)
                             )
 
-                            if wx_result.get('errcode') == 0:
-                                order_state = wx_result.get('order_state')
+                            # 修复：errcode 转为字符串比较，防止微信返回字符串 "0"
+                            if str(wx_result.get('errcode', '')) == '0':
+                                # 修复：兼容 order_state 在顶层或嵌套在 order 对象中的情况，并转为整数
+                                raw_state = wx_result.get('order_state') or (wx_result.get('order') or {}).get(
+                                    'order_state')
+                                try:
+                                    order_state = int(raw_state) if raw_state is not None else None
+                                except (ValueError, TypeError):
+                                    order_state = None
+                                    logger.warning(f"[wx_sync] order_state 转换失败，原始值: {raw_state}")
 
                                 # 微信状态：1待发货 2已发货 3确认收货 4交易完成 5已退款
                                 if order_state == 3:
@@ -178,7 +186,21 @@ def _sync_wechat_order_status():
                                             updated_at=NOW()
                                         WHERE id=%s
                                     """, (order['id'],))
+
+                                    # 补充：记录日志
+                                    cur.execute("""
+                                        INSERT INTO wechat_shipping_logs 
+                                        (order_id, order_number, transaction_id, action_type, is_success, remark, response_data, created_at)
+                                        VALUES (%s, %s, %s, 'sync', 1, %s, %s, NOW())
+                                    """, (
+                                        order['id'],
+                                        order['order_number'],
+                                        order['transaction_id'],
+                                        "微信状态同步：交易完成(4)",
+                                        json.dumps(wx_result)
+                                    ))
                                     conn.commit()
+                                    logger.info(f"[wx_sync] 订单 {order['order_number']} 状态已同步为完成(交易完成)")
 
                             else:
                                 # 查询失败记录日志
@@ -559,28 +581,34 @@ class OrderManager:
                     try:
                         wx_result = WechatShippingManager.get_order(transaction_id)
 
-                        if wx_result.get('errcode') != 0:
+                        # 修复：errcode 转为字符串比较
+                        if str(wx_result.get('errcode', '')) != '0':
                             error_msg = wx_result.get('errmsg', '未知错误')
                             result["message"] = f"查询微信订单状态失败：{error_msg}"
                             return result
 
-                        order_state = wx_result.get('order_state')
+                        # 修复：兼容 order_state 在顶层或嵌套在 order 对象中的情况，并转为整数
+                        raw_state = wx_result.get('order_state') or (wx_result.get('order') or {}).get('order_state')
+                        try:
+                            order_state = int(raw_state) if raw_state is not None else None
+                        except (ValueError, TypeError):
+                            order_state = None
+                            logger.warning(f"[confirm_receive] order_state 转换失败，原始值: {raw_state}")
 
                         # 已确认收货(3)或交易完成(4)，立即通过
                         if order_state in (3, 4):
                             break
 
-                        # 如果是待发货(1)或已发货(2)，且不是最后一次重试，等待后重试
-                        if order_state in (1, 2) and attempt < max_retries - 1:
+                        # 【关键修复】只要不是3或4（包括None、1、2、5、6），且还有重试次数，就等待后重试
+                        if attempt < max_retries - 1:
                             logger.info(
                                 f"[confirm_receive] 订单 {order_number} 微信状态 {order_state}，"
                                 f"第 {attempt + 1}/{max_retries} 次重试，等待 {retry_delay}s..."
                             )
                             time.sleep(retry_delay)
-                            continue
-
-                        # 其他状态或最后一次尝试，跳出循环处理
-                        break
+                        else:
+                            # 最后一次了，必须break，否则死循环
+                            break
 
                     except Exception as e:
                         logger.error(f"[confirm_receive] 查询微信状态异常: {e}")
