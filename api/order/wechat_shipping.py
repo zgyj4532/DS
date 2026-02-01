@@ -302,11 +302,11 @@ class WechatShippingService:
             transaction_id: str,
             openid: str,
             delivery_way: str,
-            tracking_number: Optional[str] = None,
-            express_company: Optional[str] = None,
+            tracking_number: Optional[str] = None,  # 改为可选
+            express_company: Optional[str] = None,  # 改为可选
             item_desc: Optional[str] = None,
             receiver_phone: Optional[str] = None,
-            is_sfeng: bool = False  # 新增参数：是否为顺丰
+            is_sfeng: bool = False
     ) -> Dict[str, Any]:
         """便捷方法：同步发货信息到微信"""
         logistics_type = cls.get_logistics_type(delivery_way)
@@ -315,13 +315,15 @@ class WechatShippingService:
             "item_desc": item_desc or "商品",
         }
 
-        if tracking_number:
+        # ========== 关键修复：只有实体物流（type=1）才需要物流单号和快递公司 ==========
+        if tracking_number and logistics_type == 1:
             shipping_item["tracking_no"] = tracking_number
-        if express_company:
+
+        if express_company and logistics_type == 1:
             shipping_item["express_company"] = express_company
 
-        # 顺丰需要联系方式（掩码格式）
-        if is_sfeng and receiver_phone:
+        # 顺丰需要联系方式（仅实体物流）
+        if is_sfeng and receiver_phone and logistics_type == 1:
             shipping_item["contact"] = {
                 "receiver_contact": WechatShippingManager.mask_phone(receiver_phone)
             }
@@ -329,7 +331,7 @@ class WechatShippingService:
         return WechatShippingManager.upload_shipping_info(
             transaction_id=transaction_id,
             openid=openid,
-            logistics_type=logistics_type,
+            logistics_type=logistics_type,  # 自提=4，虚拟=3
             shipping_list=[shipping_item],
             delivery_mode=1
         )

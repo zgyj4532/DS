@@ -54,7 +54,7 @@ class MerchantManager:
     @staticmethod
     def ship(
             order_number: str,
-            tracking_number: str,
+            tracking_number: Optional[str] = None,  # 改为可选
             express_company: Optional[str] = None,
             sync_to_wechat: bool = True,
             logistics_type: Optional[int] = None,
@@ -106,15 +106,48 @@ class MerchantManager:
                 openid = order_info.get("openid")
                 delivery_way = order_info.get("delivery_way", "platform")
 
-                # 如未传入物流单号，回落到订单已存的 tracking_number
-                if not tracking_number:
-                    tracking_number = order_info.get("tracking_number", "")
+                # 自动识别物流类型（如果未传入）
+                if logistics_type is None:
+                    logistics_type = WechatShippingService.get_logistics_type(delivery_way)
 
-                # 2. 更新本地订单状态
+                # ========== 关键修复：判断是否为自提或虚拟商品 ==========
+                is_self_pickup = (logistics_type == 4) or (delivery_way == "pickup")
+                is_virtual = (logistics_type == 3)
+
+                # 只有实体物流（type=1）才强制要求物流单号
+                if not is_self_pickup and not is_virtual:
+                    if not tracking_number:
+                        result["message"] = "实体物流订单必须填写物流单号"
+                        return result
+
+                    # 清理运单号格式（微信通常要求 6-32 位字母数字）
+                    tracking_trimmed = (tracking_number or "").strip()
+                    if not tracking_trimmed or len(tracking_trimmed) < 6 or len(tracking_trimmed) > 32:
+                        result["message"] = "物流单号长度不符合要求(6-32位)"
+                        return result
+                    tracking_number = tracking_trimmed
+
+                    # 实体物流缺省时兜底一个快递编码
+                    if not express_company:
+                        express_company = "YTO"  # 默认圆通
+                        logger.info("订单%s实体物流未传快递公司，已兜底为 YTO", order_number)
+                    else:
+                        express_company = express_company.strip().upper()
+
+                # 2. 更新本地订单状态（自提订单使用占位符）
+                actual_tracking = tracking_number
+                if not actual_tracking:
+                    if is_self_pickup:
+                        actual_tracking = "用户自提"
+                    elif is_virtual:
+                        actual_tracking = "虚拟商品"
+                    else:
+                        actual_tracking = ""
+
                 cur.execute(
                     "UPDATE orders SET status='pending_recv', tracking_number=%s "
                     "WHERE order_number=%s AND status='pending_ship'",
-                    (tracking_number, order_number)
+                    (actual_tracking, order_number)
                 )
                 conn.commit()
 
@@ -131,30 +164,8 @@ class MerchantManager:
                 # 3. 同步到微信小程序发货管理
                 if sync_to_wechat and transaction_id and openid:
                     try:
-                        # 自动识别物流类型
-                        if logistics_type is None:
-                            logistics_type = WechatShippingService.get_logistics_type(delivery_way)
-
-                        # 实体物流缺省时兜底一个快递编码（express_company 与 tracking_no 为必填）
-                        if logistics_type == 1:
-                            if not express_company:
-                                express_company = "YTO"  # 默认圆通，避免空值导致微信拒绝
-                                logger.info("订单%s实体物流未传快递公司，已兜底为 YTO", order_number)
-                            else:
-                                express_company = express_company.strip().upper()
-
-                            # 校验运单号基本格式（微信通常要求 6-32 位字母数字）
-                            tracking_trimmed = (tracking_number or "").strip()
-                            if not tracking_trimmed or len(tracking_trimmed) < 6 or len(tracking_trimmed) > 32:
-                                result["ok"] = False
-                                result["message"] += "，物流单号长度不符合要求(6-32位)"
-                                logger.warning("订单%s物流单号格式不合法: %s", order_number, tracking_trimmed)
-                                return result
-                            tracking_number = tracking_trimmed
-
                         # 构建商品描述
                         if not item_desc:
-                            # 查询首个商品名称
                             cur.execute(
                                 """SELECT p.name, oi.quantity 
                                    FROM order_items oi 
@@ -168,34 +179,25 @@ class MerchantManager:
                             else:
                                 item_desc = "商品"
 
-                        # 判断是否为顺丰（需要特殊处理联系方式）
-                        is_sfeng = express_company and express_company.upper() in ['SF', 'SFEXPRESS', '顺丰']
-
-                        # 收件人手机号优先使用订单收货人，缺省时回落到用户手机号
+                        # 收件人手机号
                         receiver_phone = order_info.get("consignee_phone") or order_info.get("user_phone")
 
-                        # 记录即将同步的关键信息（含十六进制视图，便于定位非UTF-8字符）
-                        def _hex(v: Any) -> str:
-                            try:
-                                return str(v).encode("utf-8", "backslashreplace").hex()
-                            except Exception:
-                                return "encode_error"
-
-                        logger.info(
-                            "微信发货同步参数 | order=%s tracking=%s express=%s item_desc=%s consignee_phone=%s user_name=%s",
-                            order_number, tracking_number, express_company, item_desc, receiver_phone,
-                            order_info.get("user_name")
-                        )
-                        logger.info(
-                            "微信发货同步参数HEX | tracking=%s express=%s item_desc=%s consignee_phone=%s user_name=%s",
-                            _hex(tracking_number), _hex(express_company), _hex(item_desc), _hex(receiver_phone),
-                            _hex(order_info.get("user_name"))
+                        # 判断是否顺丰（仅实体物流需要）
+                        is_sfeng = (
+                                not is_self_pickup and not is_virtual
+                                and express_company
+                                and express_company.upper() in ['SF', 'SFEXPRESS', '顺丰']
                         )
 
-                        # 清洗为 UTF-8，剔除控制字符，避免微信接口非 UTF-8 报错
+                        # 记录日志
+                        logger.info(
+                            "微信发货同步参数 | order=%s logistics_type=%s tracking=%s express=%s",
+                            order_number, logistics_type, tracking_number, express_company
+                        )
+
+                        # 清洗为 UTF-8，剔除控制字符
                         def _clean(val: Any) -> str:
                             s = "" if val is None else str(val)
-                            # 去除非打印控制字符
                             s = "".join(ch for ch in s if ch >= " " or ch == "\n")
                             return s.encode("utf-8", "ignore").decode("utf-8")
 
@@ -203,8 +205,8 @@ class MerchantManager:
                             transaction_id=_clean(transaction_id),
                             openid=_clean(openid),
                             delivery_way=delivery_way,
-                            tracking_number=_clean(tracking_number),
-                            express_company=_clean(express_company),
+                            tracking_number=_clean(tracking_number) if tracking_number else None,
+                            express_company=_clean(express_company) if express_company else None,
                             item_desc=_clean(item_desc),
                             receiver_phone=_clean(receiver_phone),
                             is_sfeng=is_sfeng
@@ -216,14 +218,14 @@ class MerchantManager:
                             result["message"] += "，已同步到微信发货管理"
                             logger.info(f"订单{order_number}同步到微信发货管理成功")
 
-                            # ==================== 新增：记录成功日志到数据库 ====================
+                            # 记录成功日志到数据库
                             try:
                                 cur.execute("""
-                                    INSERT INTO wechat_shipping_logs 
-                                    (order_id, order_number, transaction_id, action_type, logistics_type, 
-                                     express_company, tracking_no, is_success, response_data, created_at)
-                                    VALUES (%s, %s, %s, 'upload', %s, %s, %s, 1, %s, NOW())
-                                """, (
+                                        INSERT INTO wechat_shipping_logs 
+                                        (order_id, order_number, transaction_id, action_type, logistics_type, 
+                                         express_company, tracking_no, is_success, response_data, created_at)
+                                        VALUES (%s, %s, %s, 'upload', %s, %s, %s, 1, %s, NOW())
+                                    """, (
                                     order_info['id'],
                                     order_number,
                                     transaction_id,
@@ -235,12 +237,12 @@ class MerchantManager:
 
                                 # 更新订单的微信发货状态为已上传(1)
                                 cur.execute("""
-                                    UPDATE orders 
-                                    SET wechat_shipping_status = 1,
-                                        wechat_shipping_time = NOW(),
-                                        wechat_shipping_msg = NULL
-                                    WHERE id = %s
-                                """, (order_info['id'],))
+                                        UPDATE orders 
+                                        SET wechat_shipping_status = 1,
+                                    wechat_shipping_time = NOW(),
+                                    wechat_shipping_msg = NULL
+                                WHERE id = %s
+                            """, (order_info['id'],))
                                 conn.commit()
                             except Exception as e:
                                 logger.error(f"记录微信发货成功日志失败: {e}")
@@ -251,14 +253,14 @@ class MerchantManager:
                             result["message"] += f"，同步到微信失败：{error_msg}"
                             logger.error(f"订单{order_number}同步到微信发货管理失败：{error_msg}")
 
-                            # ==================== 新增：记录失败日志 ====================
+                            # 记录失败日志
                             try:
                                 cur.execute("""
-                                    INSERT INTO wechat_shipping_logs 
-                                    (order_id, order_number, transaction_id, action_type, logistics_type,
-                                     express_company, tracking_no, is_success, errmsg, response_data, created_at)
-                                    VALUES (%s, %s, %s, 'upload', %s, %s, %s, 0, %s, %s, NOW())
-                                """, (
+                                        INSERT INTO wechat_shipping_logs 
+                                        (order_id, order_number, transaction_id, action_type, logistics_type,
+                                         express_company, tracking_no, is_success, errmsg, response_data, created_at)
+                                        VALUES (%s, %s, %s, 'upload', %s, %s, %s, 0, %s, %s, NOW())
+                                    """, (
                                     order_info['id'],
                                     order_number,
                                     transaction_id,
@@ -271,11 +273,11 @@ class MerchantManager:
 
                                 # 更新订单的微信发货状态为失败(2)
                                 cur.execute("""
-                                    UPDATE orders 
-                                    SET wechat_shipping_status = 2,
-                                        wechat_shipping_msg = %s
-                                    WHERE id = %s
-                                """, (error_msg[:500], order_info['id']))
+                                        UPDATE orders 
+                                        SET wechat_shipping_status = 2,
+                                            wechat_shipping_msg = %s
+                                        WHERE id = %s
+                                    """, (error_msg[:500], order_info['id']))
                                 conn.commit()
                             except Exception as e:
                                 logger.error(f"记录微信发货失败日志失败: {e}")
@@ -286,11 +288,11 @@ class MerchantManager:
                         result["wechat_sync"] = {"error": str(e)}
                         result["message"] += f"，同步到微信异常：{str(e)}"
 
-                        # ==================== 新增：记录异常状态 ====================
+                        # 记录异常状态
                         try:
                             cur.execute("""
-                                UPDATE orders 
-                                SET wechat_shipping_status = 2,
+                                    UPDATE orders 
+                                    SET wechat_shipping_status = 2,
                                     wechat_shipping_msg = %s
                                 WHERE id = %s
                             """, (str(e)[:500], order_info['id']))
@@ -354,7 +356,7 @@ class MerchantManager:
 # ---------------- 请求模型 ----------------
 class MShip(BaseModel):
     order_number: str
-    tracking_number: str
+    tracking_number: Optional[str] = None  # 改为可选：自提订单不需要物流单号
     express_company: Optional[str] = None
     sync_to_wechat: bool = True
     logistics_type: Optional[int] = None  # 1=实体物流, 2=同城配送, 3=虚拟商品, 4=用户自提
@@ -400,7 +402,7 @@ def m_ship(body: MShip):
     订单发货接口，支持同步到微信小程序发货管理
 
     - 实体物流（快递）：需要填写 tracking_number 和 express_company
-    - 用户自提/虚拟商品：tracking_number 可为空
+    - 用户自提/虚拟商品：tracking_number 可为空，系统自动识别 logistics_type
 
     快递公司编码参考微信文档，常见编码：
     - SF = 顺丰速运
