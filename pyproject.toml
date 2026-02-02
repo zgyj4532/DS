@@ -25,6 +25,7 @@ dependencies = [
     "wechatpayv3>=2.0.1",
     "xmltodict>=1.0.2",
     "openpyxl>=3.1.5",
+    "redis>=7.1.0",
 ]
 
 [[tool.uv.index]]
