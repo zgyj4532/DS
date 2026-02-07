@@ -175,37 +175,111 @@ class WechatApplymentService:
                 # 验证材料完整性
                 self._validate_media(cur, user_id, applyment["id"])
 
-                # 经营类目锁定校验（如果已有审核记录）
-                if applyment.get('subject_info'):
-                    # 处理旧数据（从数据库读取）
-                    old_info_raw = applyment['subject_info']
-                    old_info = json.loads(old_info_raw) if isinstance(old_info_raw, str) else old_info_raw
+                # ✅ 修复：安全解析数据库中的 JSON 字段
+                def safe_json_loads(data):
+                    if isinstance(data, str):
+                        return json.loads(data)
+                    return data or {}
 
-                    # 处理新数据（来自请求）
-                    new_info_raw = data.get('subject_info', {})
-                    new_info = json.loads(new_info_raw) if isinstance(new_info_raw, str) else new_info_raw
+                # ✅ 修复：获取并合并最新的 subject_info
+                subject_info = safe_json_loads(applyment.get("subject_info", {}))
+                new_subject_info = data.get("subject_info", {})
 
-                    if old_info.get('business_category') and old_info.get('business_category') != new_info.get(
-                            'business_category'):
-                        raise HTTPException(status_code=400, detail="经营类目不可修改")
+                # 合并前端传入的新数据
+                if new_subject_info:
+                    if isinstance(new_subject_info, str):
+                        new_subject_info = json.loads(new_subject_info)
+                    subject_info.update(new_subject_info)
+
+                # ✅ 修复：确保 business_info 存在且完整
+                business_info = subject_info.get("business_info", {})
+
+                # 从各个字段中提取 business_info 所需信息
+                if not business_info.get("merchant_shortname"):
+                    business_info["merchant_shortname"] = (
+                            subject_info.get("merchant_shortname") or
+                            subject_info.get("business_name") or
+                            subject_info.get("subject_name", "默认商户")
+                    )
+
+                if not business_info.get("service_phone"):
+                    contact_info = safe_json_loads(applyment.get("contact_info", {}))
+                    new_contact_info = data.get("contact_info", {})
+                    if isinstance(new_contact_info, str):
+                        new_contact_info = json.loads(new_contact_info)
+                    contact_info.update(new_contact_info)
+
+                    business_info["service_phone"] = (
+                            contact_info.get("mobile") or
+                            contact_info.get("service_phone", "")
+                    )
+
+                if not business_info.get("business_category"):
+                    business_info["business_category"] = subject_info.get("business_category", [])
+
+                # 确保 business_category 是数组
+                if isinstance(business_info["business_category"], str):
+                    business_info["business_category"] = [business_info["business_category"]]
+
+                subject_info["business_info"] = business_info
+
+                # ✅ 修复：更新数据库中的 subject_info
+                update_data = {
+                    "subject_info": json.dumps(subject_info, ensure_ascii=False),
+                    "updated_at": datetime.datetime.now()
+                }
+
+                # 如果有新的 contact_info 也更新
+                if data.get("contact_info"):
+                    contact_info = safe_json_loads(applyment.get("contact_info", {}))
+                    new_contact_info = data.get("contact_info", {})
+                    if isinstance(new_contact_info, str):
+                        new_contact_info = json.loads(new_contact_info)
+                    contact_info.update(new_contact_info)
+                    update_data["contact_info"] = json.dumps(contact_info, ensure_ascii=False)
+
+                # 如果有新的 bank_account_info 也更新
+                if data.get("bank_account_info"):
+                    bank_info = safe_json_loads(applyment.get("bank_account_info", {}))
+                    new_bank_info = data.get("bank_account_info", {})
+                    if isinstance(new_bank_info, str):
+                        new_bank_info = json.loads(new_bank_info)
+                    bank_info.update(new_bank_info)
+                    # 加密敏感信息
+                    bank_info = self._encrypt_bank_info(bank_info)
+                    update_data["bank_account_info"] = json.dumps(bank_info, ensure_ascii=False)
+
+                where_clause = "id = %s"
+                update_sql = build_dynamic_update(cur, "wx_applyment", update_data, where_clause)
+                params = list(update_data.values()) + [applyment["id"]]
+                cur.execute(update_sql, tuple(params))
+                conn.commit()
+
+                # ✅ 修复：准备提交数据（确保所有字段都是 JSON 字符串）
+                submit_data = {
+                    "business_code": applyment["business_code"],
+                    "subject_info": json.dumps(subject_info, ensure_ascii=False),
+                    "contact_info": update_data.get("contact_info", applyment["contact_info"]),
+                    "bank_account_info": update_data.get("bank_account_info", applyment["bank_account_info"])
+                }
 
                 # 调用微信支付API提交进件
                 try:
-                    response = self.pay_client.submit_applyment(applyment)
+                    logger.info(f"【submit_applyment】准备提交数据，business_code: {submit_data['business_code']}")
+                    response = self.pay_client.submit_applyment(submit_data)
                     applyment_id = response.get("applyment_id")
 
                     # 更新状态
-                    update_data = {
+                    final_update_data = {
                         "applyment_id": applyment_id,
                         "applyment_state": "APPLYMENT_STATE_AUDITING",
                         "is_draft": 0,
                         "submitted_at": datetime.datetime.now(),
                         "updated_at": datetime.datetime.now()
                     }
-                    update_sql = build_dynamic_update(cur, "wx_applyment", update_data, "id = %s")
-                    # 关键修复：合并SET参数和WHERE参数
-                    params = list(update_data.values()) + [applyment["id"]]
-                    cur.execute(update_sql, tuple(params))
+                    final_update_sql = build_dynamic_update(cur, "wx_applyment", final_update_data, "id = %s")
+                    final_params = list(final_update_data.values()) + [applyment["id"]]
+                    cur.execute(final_update_sql, tuple(final_params))
 
                     # 记录日志
                     self._log_state_change(cur, applyment["id"], applyment["business_code"],
@@ -470,16 +544,28 @@ class WechatApplymentService:
                 if not self._check_reject_issues_fixed(cur, applyment_id):
                     raise HTTPException(status_code=400, detail="请先根据驳回原因修改信息")
 
-                # 调用微信支付API重新提交
-                response = self.pay_client.submit_applyment(applyment)
+                # ✅ 修复：准备提交数据（从数据库记录构建）
+                submit_data = {
+                    "business_code": applyment["business_code"],
+                    "subject_info": applyment["subject_info"],
+                    "contact_info": applyment["contact_info"],
+                    "bank_account_info": applyment["bank_account_info"]
+                }
 
-                # 更新状态
+                # 调用微信支付API重新提交
+                response = self.pay_client.submit_applyment(submit_data)
+                wx_applyment_id = response.get("applyment_id")
+
+                # ✅ 修复：更新更多字段
                 update_data = {
+                    "applyment_id": wx_applyment_id,  # 微信申请单号
                     "applyment_state": "APPLYMENT_STATE_AUDITING",
+                    "applyment_state_msg": response.get("state_msg"),  # 新状态消息
+                    "audit_detail": None,  # 清空驳回详情
+                    "submitted_at": datetime.datetime.now(),  # 提交时间
                     "updated_at": datetime.datetime.now()
                 }
                 update_sql = build_dynamic_update(cur, "wx_applyment", update_data, "id = %s")
-                # 关键修复：合并SET参数和WHERE参数
                 params = list(update_data.values()) + [applyment_id]
                 cur.execute(update_sql, tuple(params))
 
@@ -489,8 +575,8 @@ class WechatApplymentService:
                                        "USER", "用户重新提交")
 
                 conn.commit()
-                logger.info(f"用户 {user_id} 重新提交进件: {applyment_id}")
-                return {"applyment_id": applyment_id}
+                logger.info(f"用户 {user_id} 重新提交进件: {applyment_id}, 微信单号: {wx_applyment_id}")
+                return {"applyment_id": applyment_id, "wx_applyment_id": wx_applyment_id}
 
     def get_merchant_info(self, user_id: int) -> dict:
         """获取商户号信息"""

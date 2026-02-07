@@ -432,24 +432,98 @@ class WeChatPayClient:
         url_path = "/v3/applyment4sub/applyment/"
         full_url = f"{self.BASE_URL}{url_path}"
 
+        # ✅ 修复：安全解析 JSON 字段（处理已经是 dict 的情况）
+        def safe_json_loads(data):
+            if isinstance(data, str):
+                return json.loads(data)
+            return data or {}
+
+        # ✅ 修复：解析所有 JSON 字段
+        subject_info = safe_json_loads(applyment_data.get("subject_info", {}))
+        contact_info = safe_json_loads(applyment_data.get("contact_info", {}))
+        bank_account_info = safe_json_loads(applyment_data.get("bank_account_info", {}))
+
+        # ✅ 修复：构建 business_info（必需字段）
+        business_info = subject_info.get("business_info", {})
+        if not business_info:
+            # 从 subject_info 或 contact_info 中提取构建
+            business_info = {
+                "merchant_shortname": subject_info.get("merchant_shortname", "") or subject_info.get("business_name",
+                                                                                                     ""),
+                "service_phone": contact_info.get("mobile", "") or contact_info.get("service_phone", ""),
+                "business_category": subject_info.get("business_category", [])
+            }
+
+        # ✅ 确保 business_category 是数组
+        if isinstance(business_info.get("business_category"), str):
+            business_info["business_category"] = [business_info["business_category"]]
+        elif not business_info.get("business_category"):
+            business_info["business_category"] = []
+
+        # ✅ 构建完整请求体
         payload = {
             "business_code": applyment_data["business_code"],
-            "contact_info": json.loads(applyment_data["contact_info"]),
-            "subject_info": json.loads(applyment_data["subject_info"]),
-            "bank_account_info": json.loads(applyment_data["bank_account_info"]),
+            "contact_info": contact_info,
+            "subject_info": subject_info,
+            "bank_account_info": bank_account_info,
+            "business_info": business_info  # ✅ 添加必需字段
         }
 
+        # ✅ 修复：清理空值和敏感数据（微信 API 对空字符串敏感）
+        def clean_payload(obj):
+            if isinstance(obj, dict):
+                cleaned = {}
+                for k, v in obj.items():
+                    if v is None or v == "":
+                        continue
+                    if isinstance(v, (dict, list)):
+                        cleaned_v = clean_payload(v)
+                        if cleaned_v or cleaned_v == []:  # 保留空数组
+                            cleaned[k] = cleaned_v
+                    else:
+                        cleaned[k] = v
+                return cleaned
+            elif isinstance(obj, list):
+                return [clean_payload(item) for item in obj if item is not None]
+            return obj
+
+        payload = clean_payload(payload)
         body_str = json.dumps(payload, ensure_ascii=False)
+
+        # ✅ 修复：使用公钥ID作为 Wechatpay-Serial
         headers = {
-            'Authorization': self._build_auth_header('POST', url_path, body_str),  # ✅ 使用路径
+            'Authorization': self._build_auth_header('POST', url_path, body_str),
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'Wechatpay-Serial': self._get_merchant_serial_no()
+            'Wechatpay-Serial': self.pub_key_id or self._get_merchant_serial_no()
         }
 
-        response = self.session.post(full_url, data=body_str.encode('utf-8'), headers=headers, timeout=30)
-        response.raise_for_status()
-        return response.json()
+        # ✅ 添加详细日志
+        logger.info(f"【submit_applyment】请求URL: {full_url}")
+        logger.info(f"【submit_applyment】请求体前500字: {body_str[:500]}...")
+        logger.info(f"【submit_applyment】Wechatpay-Serial: {headers['Wechatpay-Serial']}")
+
+        try:
+            response = self.session.post(full_url, data=body_str.encode('utf-8'), headers=headers, timeout=30)
+
+            # ✅ 添加响应日志
+            logger.info(f"【submit_applyment】响应状态码: {response.status_code}")
+            logger.info(f"【submit_applyment】响应内容前500字: {response.text[:500]}...")
+
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"【submit_applyment】HTTP错误: {e.response.status_code}")
+            logger.error(f"【submit_applyment】错误响应: {e.response.text}")
+            try:
+                error_data = e.response.json()
+                error_msg = error_data.get("message", error_data.get("detail", str(e)))
+                raise Exception(f"微信API错误: {error_msg}")
+            except json.JSONDecodeError:
+                raise Exception(f"提交失败: {e.response.text}")
+            except Exception as ex:
+                raise Exception(f"提交失败: {str(ex)}")
 
     @query_rate_limiter
     def query_applyment_status(self, applyment_id: int) -> Dict[str, Any]:
