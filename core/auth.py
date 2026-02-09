@@ -119,7 +119,7 @@ async def _get_user_from_wechat_token(token: str) -> Dict[str, Any]:
                     # 使用 sessions 表（推荐方式）
                     cur.execute("""
                         SELECT s.user_id AS id, u.mobile, u.name, u.avatar_path, 
-                               u.is_merchant, u.wechat_sub_mchid, u.member_level, u.status
+                               u.is_merchant, u.wechat_sub_mchid, u.member_level, u.status,u.openid
                         FROM sessions s
                         JOIN users u ON s.user_id = u.id
                         WHERE s.token = %s AND s.expired_at > NOW()
@@ -129,7 +129,7 @@ async def _get_user_from_wechat_token(token: str) -> Dict[str, Any]:
                     # 回退到 users.token 字段
                     cur.execute("""
                         SELECT id, mobile, name, avatar_path, is_merchant, 
-                               wechat_sub_mchid, member_level, status
+                               wechat_sub_mchid, member_level, status, openid
                         FROM users 
                         WHERE token = %s
                         LIMIT 1
@@ -194,7 +194,7 @@ async def _get_user_from_jwt(token: str) -> Dict[str, Any]:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT id, mobile, name, avatar_path, is_merchant, wechat_sub_mchid, 
-                           member_level, status, created_at
+                           member_level, status, created_at, openid
                     FROM users 
                     WHERE id = %s
                     LIMIT 1
@@ -278,7 +278,7 @@ async def _get_user_from_uuid(token: str) -> Dict[str, Any]:
                     # ✅ 修复：明确指定返回字段名为 id（使用别名）
                     cur.execute("""
                         SELECT s.user_id AS id, u.mobile, u.name, u.avatar_path, 
-                               u.is_merchant, u.wechat_sub_mchid, u.member_level, u.status
+                               u.is_merchant, u.wechat_sub_mchid, u.member_level, u.status, u.openid
                         FROM sessions s
                         JOIN users u ON s.user_id = u.id
                         WHERE s.token = %s AND s.expired_at > NOW()
@@ -288,7 +288,7 @@ async def _get_user_from_uuid(token: str) -> Dict[str, Any]:
                     # 回退到 users.token 字段（兼容旧版）
                     cur.execute("""
                         SELECT id, mobile, name, avatar_path, is_merchant, 
-                               wechat_sub_mchid, member_level, status
+                               wechat_sub_mchid, member_level, status, openid
                         FROM users 
                         WHERE token = %s
                         LIMIT 1
