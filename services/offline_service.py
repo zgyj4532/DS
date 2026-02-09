@@ -391,9 +391,3 @@ class OfflineService:
             )
             
             logger.info(f"[on_paid] 线下订单完成: {order_no}, 金额: {amount}, 商户实收: {merchant_amount}")
-            # 给商家转账（金额应为实收金额，即优惠后金额）
-            await notify_merchant(
-                merchant_id=order["merchant_id"],  # 使用订单中的商户ID
-                order_no=order_no, 
-                amount=int((amount - coupon_discount) * 100)
-)

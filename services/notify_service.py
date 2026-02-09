@@ -240,19 +240,8 @@ async def _handle_offline_pay_notify(order_no: str, wx_total: int, data: dict) -
                     """,
                     (data.get("transaction_id", ""), order["id"])
                 )
-                
-                # 6. 【可选】给商户转账/通知
-                try:
-                    await notify_merchant(
-                        merchant_id=order["merchant_id"],
-                        order_no=order_no,
-                        amount=wx_total  # 分
-                    )
-                except Exception as e:
-                    # 通知失败不影响订单状态，记录即可
-                    logger.error(f"[offline-pay] 商户通知失败: {e}")
 
-                # 7.资金分账：平台抽成各池 + 商户转账通知
+                # 6.资金分账：平台抽成各池 + 商户转账通知
                 try:
                     from services.offline_service import OfflineService
                     from decimal import Decimal
