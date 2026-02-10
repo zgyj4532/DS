@@ -20,18 +20,18 @@ class TaskScheduler:
         # 延迟导入，避免启动时循环依赖
         from api.order.wechat_shipping import WechatShippingManager
 
-        # 每天凌晨2点清理过期草稿
+        # 每天凌晨4点清理过期草稿
         self.scheduler.add_job(
             self.clean_expired_drafts,
-            CronTrigger(hour=2, minute=0),
+            CronTrigger(hour=4, minute=0),
             id="clean_expired_drafts",
             replace_existing=True
         )
 
-        # 每5分钟轮询审核中的进件状态
+        # 每10分钟轮询审核中的进件状态
         self.scheduler.add_job(
             self.poll_applyment_status,
-            CronTrigger(minute="*/5"),
+            CronTrigger(minute="*/10"),
             id="poll_applyment_status",
             replace_existing=True
         )
@@ -65,7 +65,7 @@ class TaskScheduler:
         # 每天12:00 刷新微信快递公司列表缓存
         self.scheduler.add_job(
             WechatShippingManager.refresh_delivery_list_cache,
-            CronTrigger(hour=12, minute=0),
+            CronTrigger(hour=4, minute=0),
             id="refresh_delivery_list_daily",
             replace_existing=True,
             misfire_grace_time=3600
