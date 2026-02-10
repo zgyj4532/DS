@@ -23,6 +23,48 @@ class WechatApplymentService:
         self.pay_client = WeChatPayClient()  # ✅ 修复：WechatPayClient → WeChatPayClient
         self.max_file_size = MAX_FILE_SIZE_MB * 1024 * 1024
 
+    def _extract_id_card_periods(self, subject_info: Any) -> tuple[Optional[str], Optional[str]]:
+        """从 subject_info 中提取身份证有效期，允许字符串 JSON 输入。"""
+        info = subject_info or {}
+        if isinstance(info, str):
+            try:
+                info = json.loads(info)
+            except Exception:
+                info = {}
+
+        identity_info = info.get("identity_info") or {}
+        if isinstance(identity_info, str):
+            try:
+                identity_info = json.loads(identity_info)
+            except Exception:
+                identity_info = {}
+
+        id_card_info = identity_info.get("id_card_info") or {}
+        if isinstance(id_card_info, str):
+            try:
+                id_card_info = json.loads(id_card_info)
+            except Exception:
+                id_card_info = {}
+
+        begin = (
+            id_card_info.get("card_period_begin")
+            or identity_info.get("card_period_begin")
+            or info.get("card_period_begin")
+        )
+        end = (
+            id_card_info.get("card_period_end")
+            or identity_info.get("card_period_end")
+            or info.get("card_period_end")
+        )
+
+        def _normalize(val: Any) -> Optional[str]:
+            if val is None:
+                return None
+            text = str(val).strip()
+            return text if text else None
+
+        return _normalize(begin), _normalize(end)
+
     def _get_realname_data(self, user_id: int) -> Optional[Dict[str, Any]]:
         """获取实名认证数据"""
         with get_conn() as conn:
@@ -90,6 +132,7 @@ class WechatApplymentService:
                 subject_info = data.get("subject_info", {})
                 contact_info = data.get("contact_info", {})
                 bank_account_info = data.get("bank_account_info", {})
+                card_period_begin, card_period_end = self._extract_id_card_periods(subject_info)
 
                 # 加密银行卡信息
                 if bank_account_info:
@@ -101,6 +144,8 @@ class WechatApplymentService:
                         "subject_info": json.dumps(subject_info, ensure_ascii=False),
                         "contact_info": json.dumps(contact_info, ensure_ascii=False),
                         "bank_account_info": json.dumps(bank_account_info, ensure_ascii=False),
+                        "card_period_begin": card_period_begin,
+                        "card_period_end": card_period_end,
                         "draft_expired_at": draft_expires_at,
                         "updated_at": datetime.datetime.now()
                     }
@@ -118,10 +163,11 @@ class WechatApplymentService:
                         INSERT INTO wx_applyment (
                             user_id, business_code, subject_type, 
                             subject_info, contact_info, bank_account_info,
+                            card_period_begin, card_period_end,
                             applyment_state, is_draft, draft_expired_at,
                             created_at, updated_at
                         ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
                         )
                     """
                     cur.execute(insert_sql, (
@@ -131,6 +177,8 @@ class WechatApplymentService:
                         json.dumps(subject_info, ensure_ascii=False),
                         json.dumps(contact_info, ensure_ascii=False),
                         json.dumps(bank_account_info, ensure_ascii=False),
+                        card_period_begin,
+                        card_period_end,
                         "APPLYMENT_STATE_EDITTING",
                         1,
                         draft_expires_at
@@ -162,6 +210,9 @@ class WechatApplymentService:
                 # 检查草稿是否过期
                 if applyment["draft_expired_at"] and applyment["draft_expired_at"] < datetime.datetime.now():
                     raise HTTPException(status_code=400, detail="草稿已过期，请重新填写")
+
+                # 前端提交的主体类型优先，避免使用过期的草稿值
+                applyment["subject_type"] = data.get("subject_type") or applyment.get("subject_type")
 
                 # 关联用户所有材料到当前草稿（按材料类型）
                 cur.execute("""
@@ -222,6 +273,27 @@ class WechatApplymentService:
                         except Exception:
                             business_info_raw = {}
 
+                    # 解析最新提交的主体信息（包含身份证有效期）
+                    incoming_subject_info_raw = data.get("subject_info") or {}
+                    incoming_subject_info = (
+                        json.loads(incoming_subject_info_raw)
+                        if isinstance(incoming_subject_info_raw, str)
+                        else incoming_subject_info_raw
+                        or {}
+                    )
+                    incoming_identity_info = incoming_subject_info.get("identity_info") or {}
+                    if isinstance(incoming_identity_info, str):
+                        try:
+                            incoming_identity_info = json.loads(incoming_identity_info)
+                        except Exception:
+                            incoming_identity_info = {}
+                    incoming_id_card_info = incoming_identity_info.get("id_card_info") or {}
+                    if isinstance(incoming_id_card_info, str):
+                        try:
+                            incoming_id_card_info = json.loads(incoming_id_card_info)
+                        except Exception:
+                            incoming_id_card_info = {}
+
                     # 从已上传材料回填身份证件 media_id
                     cur.execute(
                         """
@@ -254,6 +326,38 @@ class WechatApplymentService:
                     if id_card_media.get("id_card_back"):
                         id_card_info["id_card_national"] = id_card_media["id_card_back"]
 
+                    # 回填身份证有效期：优先使用最新提交的数据，其次使用草稿中的存量值
+                    if not id_card_info.get("card_period_begin"):
+                        candidate_begin = (
+                            incoming_id_card_info.get("card_period_begin")
+                            or incoming_identity_info.get("card_period_begin")
+                            or incoming_subject_info.get("card_period_begin")
+                        )
+                        if candidate_begin:
+                            id_card_info["card_period_begin"] = str(candidate_begin)
+
+                    if not id_card_info.get("card_period_end"):
+                        candidate_end = (
+                            incoming_id_card_info.get("card_period_end")
+                            or incoming_identity_info.get("card_period_end")
+                            or incoming_subject_info.get("card_period_end")
+                        )
+                        if candidate_end:
+                            id_card_info["card_period_end"] = str(candidate_end)
+
+                    # 前置校验必填项，避免将缺失字段提交至微信
+                    if applyment.get("subject_type") == "SUBJECT_TYPE_INDIVIDUAL":
+                        missing_period = []
+                        if not id_card_info.get("card_period_begin"):
+                            missing_period.append("身份证有效期开始时间")
+                        if not id_card_info.get("card_period_end"):
+                            missing_period.append("身份证有效期结束时间")
+                        if missing_period:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="请先填写" + "、".join(missing_period)
+                            )
+
                     if id_card_info:
                         identity_info["id_card_info"] = id_card_info
                         subject_info["identity_info"] = identity_info
@@ -274,12 +378,17 @@ class WechatApplymentService:
                     response = self.pay_client.submit_applyment(applyment)
                     applyment_id = response.get("applyment_id")
 
+                    card_period_begin = id_card_info.get("card_period_begin")
+                    card_period_end = id_card_info.get("card_period_end")
+
                     # 更新状态
                     final_update_data = {
                         "applyment_id": applyment_id,
                         "applyment_state": "APPLYMENT_STATE_AUDITING",
                         "is_draft": 0,
                         "submitted_at": datetime.datetime.now(),
+                        "card_period_begin": card_period_begin,
+                        "card_period_end": card_period_end,
                         "updated_at": datetime.datetime.now()
                     }
                     final_update_sql = build_dynamic_update(cur, "wx_applyment", final_update_data, "id = %s")
@@ -478,6 +587,7 @@ class WechatApplymentService:
                 # 检查是否修改了核心信息（经营类目或结算账户）
                 new_bank_info = data.get("bank_account_info", {})
                 old_subject_info = json.loads(existing["subject_info"])
+                old_card_period_begin, old_card_period_end = self._extract_id_card_periods(old_subject_info)
 
                 # 经营类目不可修改校验
                 if 'business_category' in new_bank_info and old_subject_info.get(
@@ -505,6 +615,8 @@ class WechatApplymentService:
                     "business_code": new_business_code,
                     "subject_type": old_subject_type,  # ← 使用数据库字段值
                     "subject_info": existing["subject_info"],
+                    "card_period_begin": old_card_period_begin,
+                    "card_period_end": old_card_period_end,
                     "contact_info": json.dumps(data.get("contact_info", {}), ensure_ascii=False),
                     "bank_account_info": json.dumps(new_bank_info, ensure_ascii=False),
                     "applyment_state": "APPLYMENT_STATE_EDITTING",
@@ -521,6 +633,8 @@ class WechatApplymentService:
                     new_business_code,
                     old_subject_type,
                     existing["subject_info"],
+                    old_card_period_begin,
+                    old_card_period_end,
                     json.dumps(data.get("contact_info", {}), ensure_ascii=False),
                     json.dumps(new_bank_info, ensure_ascii=False),
                     "APPLYMENT_STATE_EDITTING",

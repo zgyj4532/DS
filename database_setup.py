@@ -560,6 +560,8 @@ class DatabaseManager:
                         'SUBJECT_TYPE_OTHERS'
                     ) NOT NULL COMMENT '主体类型',
                     subject_info JSON NOT NULL COMMENT '主体资料（营业执照、法人信息等）',
+                    card_period_begin VARCHAR(32) NULL COMMENT '身份证有效期开始（可存长期）',
+                    card_period_end VARCHAR(32) NULL COMMENT '身份证有效期结束（可存长期）',
                     contact_info JSON NOT NULL COMMENT '超级管理员信息',
                     bank_account_info JSON NOT NULL COMMENT '结算账户信息',
                     applyment_state ENUM(
@@ -811,6 +813,8 @@ class DatabaseManager:
             },
             'wx_applyment': {
                 'is_timeout_alerted': "is_timeout_alerted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '审核超时提醒是否已发送'",
+                'card_period_begin': "card_period_begin VARCHAR(32) NULL COMMENT '身份证有效期开始（可存长期）'",
+                'card_period_end': "card_period_end VARCHAR(32) NULL COMMENT '身份证有效期结束（可存长期）'",
             }
         }
         
