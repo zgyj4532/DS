@@ -73,3 +73,35 @@ class CouponUseRequest(BaseModel):
 class RefundRequest(BaseModel):
     """退款请求模型"""
     order_no: str
+
+
+# ==================== 微信支付商户账户提现到银行卡（自提）请求模型 ====================
+class MerchantWithdrawToBankcardRequest(BaseModel):
+    """
+    商户账户提现到银行卡（自提）请求模型
+
+    用途：商户号余额→对公/对私银行卡
+    接口地址：POST https://api.mch.weixin.qq.com/v3/merchant/fund/withdraw
+    """
+    out_request_no: str = Field(..., min_length=1, max_length=32,
+                                description="商户提现单号，由商户自定义生成，必须是字母数字")
+    amount: int = Field(..., gt=0, le=800000000,
+                        description="提现金额，单位：分，不能超过8亿元")
+    account_type: str = Field('BASIC', pattern=r'^(BASIC|OPERATION|FEES)$',
+                              description="出款账户类型：BASIC=基本账户，OPERATION=运营账户，FEES=手续费账户")
+    bank_memo: Optional[str] = Field(None, max_length=32,
+                                     description="银行附言，展示在收款银行系统中的附言")
+    remark: Optional[str] = Field(None, max_length=56,
+                                  description="提现备注，商户自定义字段")
+    notify_url: Optional[str] = Field(None, max_length=256,
+                                      description="提现结果通知地址，异步接收提现结果通知的回调地址")
+
+
+class MerchantWithdrawQueryRequest(BaseModel):
+    """
+    查询商户提现状态请求模型
+
+    接口地址：GET https://api.mch.weixin.qq.com/v3/merchant/fund/withdraw/out-request-no/{out_request_no}
+    """
+    out_request_no: str = Field(..., min_length=1, max_length=32,
+                                description="商户提现单号")

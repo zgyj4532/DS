@@ -16,7 +16,8 @@ from core.config import PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE, MAX_TEAM_LAY
 from models.schemas.finance import (
     ResponseModel, UserCreateRequest, ProductCreateRequest, OrderRequest,
     WithdrawalRequest, WithdrawalAuditRequest, RewardAuditRequest,
-    CouponUseRequest, RefundRequest
+    CouponUseRequest, RefundRequest,
+    MerchantWithdrawToBankcardRequest, MerchantWithdrawQueryRequest
 )
 from typing import List
 from pydantic import BaseModel
@@ -1209,3 +1210,161 @@ async def get_all_points_detail_report(
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])
+
+
+# ==================== 微信支付商户账户提现到银行卡（自提）接口 ====================
+@router.post("/api/withdraw/merchant-to-bankcard", response_model=ResponseModel, summary="商户账户提现到银行卡（自提）")
+async def merchant_withdraw_to_bankcard(
+        request: MerchantWithdrawToBankcardRequest,
+        service: FinanceService = Depends(get_finance_service)
+):
+    """
+    商户账户提现到银行卡（自提）
+
+    用途：将商户号余额提现到对公/对私银行卡
+    对应微信支付接口：POST https://api.mch.weixin.qq.com/v3/merchant/fund/withdraw
+
+    关键参数说明：
+    - out_request_no: 商户提现单号，唯一标识一笔提现
+    - amount: 提现金额（单位：分）
+    - account_type: 出款账户类型（BASIC=基本账户，OPERATION=运营账户，FEES=手续费账户）
+    - bank_memo: 银行附言，展示在收款银行系统中的附言
+    - remark: 提现备注
+
+    使用场景：
+    - 商户自身资金提现（区别于用户提现到零钱）
+    - 电商平台二级商户提现到银行卡
+    """
+    try:
+        result = service.merchant_withdraw_to_bankcard(
+            out_request_no=request.out_request_no,
+            amount=request.amount,
+            account_type=request.account_type,
+            bank_memo=request.bank_memo,
+            remark=request.remark,
+            notify_url=request.notify_url
+        )
+        return ResponseModel(
+            success=True,
+            message="商户提现申请已提交",
+            data=result
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"商户提现到银行卡失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"提现失败: {str(e)}")
+
+
+@router.get("/api/withdraw/merchant-to-bankcard/query", response_model=ResponseModel, summary="查询商户提现状态")
+async def query_merchant_withdraw_status(
+        out_request_no: str = Query(..., min_length=1, max_length=32, description="商户提现单号"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """
+    查询商户账户提现到银行卡的状态
+
+    对应微信支付接口：GET https://api.mch.weixin.qq.com/v3/merchant/fund/withdraw/out-request-no/{out_request_no}
+
+    返回信息包括：
+    - 提现单状态（INIT:初始态/SUCCESS:成功/FAIL:失败/PROCESSING:处理中）
+    - 提现金额
+    - 失败原因（如果失败）
+    - 银行附言
+    - 提现备注
+    """
+    try:
+        result = service.query_merchant_withdraw_status(out_request_no=out_request_no)
+        return ResponseModel(
+            success=True,
+            message="查询成功",
+            data=result
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"查询商户提现状态失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+
+@router.get("/api/withdraw/merchant-to-bankcard/list", response_model=ResponseModel, summary="查询商户提现记录列表")
+async def list_merchant_withdraw_records(
+        start_date: Optional[str] = Query(None, description="开始日期 yyyy-MM-dd"),
+        end_date: Optional[str] = Query(None, description="结束日期 yyyy-MM-dd"),
+        status: Optional[str] = Query(None, pattern=r'^(INIT|SUCCESS|FAIL|PROCESSING)$', description="提现状态筛选"),
+        page: int = Query(1, ge=1, description="页码"),
+        page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+        service: FinanceService = Depends(get_finance_service)
+):
+    """
+    查询商户提现到银行卡的历史记录列表
+
+    支持按日期范围和状态筛选，支持分页
+    """
+    try:
+        data = service.list_merchant_withdraw_records(
+            start_date=start_date,
+            end_date=end_date,
+            status=status,
+            page=page,
+            page_size=page_size
+        )
+        return ResponseModel(
+            success=True,
+            message=f"查询成功: 共{len(data['records'])}条记录",
+            data=data
+        )
+    except Exception as e:
+        logger.error(f"查询商户提现记录列表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 接口选择建议文档接口 ====================
+@router.get("/api/withdraw/guide", response_model=ResponseModel, summary="提现接口选择指南")
+async def get_withdraw_guide():
+    """
+    提现接口选择建议指南
+
+    根据不同场景提供接口选择建议：
+    - 用户提现→选商家转账到零钱
+    - 电商平台二级商户提现→选电商收付通余额提现
+    - 商户自身资金提现→选商户账户提现到银行卡（本接口）
+    """
+    guide = {
+        "title": "提现接口选择指南",
+        "interfaces": [
+            {
+                "name": "商家转账到零钱",
+                "endpoint": "/api/withdraw/batches",
+                "scenario": "用户提现",
+                "description": "用于将资金从商户号转账到用户的微信零钱",
+                "use_cases": ["用户佣金提现", "用户奖励发放", "用户退款到零钱"]
+            },
+            {
+                "name": "电商收付通余额提现",
+                "endpoint": "/api/ecommerce/withdraw",
+                "scenario": "电商平台二级商户提现",
+                "description": "用于电商平台二级商户将余额提现到绑定的银行卡",
+                "use_cases": ["二级商户结算", "二级商户自主提现"]
+            },
+            {
+                "name": "商户账户提现到银行卡（自提）",
+                "endpoint": "/api/withdraw/merchant-to-bankcard",
+                "scenario": "商户自身资金提现",
+                "description": "用于商户将自身账户余额提现到对公/对私银行卡",
+                "use_cases": ["商户利润提现", "商户运营资金提取", "商户手续费账户提现"],
+                "note": "本接口适用于商户自身资金提现，区别于用户提现"
+            }
+        ],
+        "selection_criteria": {
+            "用户提现": "使用【商家转账到零钱】接口",
+            "电商平台二级商户提现": "使用【电商收付通余额提现】接口",
+            "商户自身资金提现": "使用【商户账户提现到银行卡（自提）】接口"
+        }
+    }
+
+    return ResponseModel(
+        success=True,
+        message="获取提现接口选择指南成功",
+        data=guide
+    )

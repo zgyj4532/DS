@@ -6571,6 +6571,268 @@ class FinanceService:
                     "records": formatted_records,
                     "remark": "整合用户积分(member_points)、商家积分(merchant_points)和公司积分池(company_points)的完整流水明细，grand_total.current_balance_total为三种积分余额总和，current_balance_total为三种积分余额总和，current_balance_total为三种积分余额总和，current_balance_total为三种积分余额总和"
                 }
+
+# ==================== 微信支付商户账户提现到银行卡（自提）功能 ====================
+    def merchant_withdraw_to_bankcard(
+            self,
+            out_request_no: str,
+            amount: int,
+            account_type: str = 'BASIC',
+            bank_memo: Optional[str] = None,
+            remark: Optional[str] = None,
+            notify_url: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        商户账户提现到银行卡（自提）
+        ...
+        """
+        import uuid
+        import time
+        from datetime import datetime
+
+        logger.info(
+            f"商户提现到银行卡申请: out_request_no={out_request_no}, amount={amount}, account_type={account_type}")
+
+        # 参数校验
+        if amount <= 0:
+            raise FinanceException("提现金额必须大于0")
+        if amount > 800000000:  # 8亿元限制
+            raise FinanceException("提现金额不能超过8亿元")
+
+        # 检查提现单号是否已存在
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM merchant_withdraw_records WHERE out_request_no = %s",
+                    (out_request_no,)
+                )
+                if cur.fetchone():
+                    raise FinanceException(f"提现单号 {out_request_no} 已存在，请勿重复提交")
+
+        # 构建微信支付请求参数
+        request_data = {
+            "out_request_no": out_request_no,
+            "amount": amount,
+            "account_type": account_type
+        }
+
+        if bank_memo:
+            request_data["bank_memo"] = bank_memo
+        if remark:
+            request_data["remark"] = remark
+        if notify_url:
+            request_data["notify_url"] = notify_url
+
+        try:
+            # 模拟调用微信支付接口（实际项目中替换为真实调用）
+            mock_response = {
+                "withdraw_id": f"WD{uuid.uuid4().hex[:16].upper()}",
+                "out_request_no": out_request_no,
+                "amount": amount,
+                "account_type": account_type,
+                "status": "INIT",
+                "create_time": datetime.now().strftime("%Y-%m-%dT%H:%M:%S+08:00")
+            }
+
+            # 记录提现申请到数据库
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO merchant_withdraw_records 
+                           (out_request_no, withdraw_id, amount, account_type, 
+                            bank_memo, remark, status, notify_url, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
+                        (
+                            out_request_no,
+                            mock_response["withdraw_id"],
+                            amount,
+                            account_type,
+                            bank_memo,
+                            remark,
+                            "INIT",
+                            notify_url
+                        )
+                    )
+
+                    # 记录资金池流水（从平台收入池扣除）
+                    self._add_pool_balance(
+                        cur,
+                        'platform_revenue_pool',
+                        -Decimal(str(amount / 100)),  # 转换为元
+                        f"商户提现到银行卡 - 单号:{out_request_no}, 金额:{amount / 100:.2f}元",
+                        related_user=None
+                    )
+
+                    conn.commit()
+
+            logger.info(f"商户提现申请成功: withdraw_id={mock_response['withdraw_id']}")
+
+            return {
+                "withdraw_id": mock_response["withdraw_id"],
+                "out_request_no": out_request_no,
+                "amount": amount,
+                "amount_yuan": amount / 100,
+                "account_type": account_type,
+                "status": "INIT",
+                "status_text": "初始态，已提交申请",
+                "create_time": mock_response["create_time"],
+                "remark": remark,
+                "bank_memo": bank_memo
+            }
+
+        except Exception as e:
+            logger.error(f"商户提现申请失败: {e}", exc_info=True)
+            raise FinanceException(f"提现申请失败: {str(e)}")
+
+    def query_merchant_withdraw_status(self, out_request_no: str) -> Dict[str, Any]:
+        """
+        查询商户提现状态
+        ...
+        """
+        logger.info(f"查询商户提现状态: out_request_no={out_request_no}")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT * FROM merchant_withdraw_records 
+                       WHERE out_request_no = %s""",
+                    (out_request_no,)
+                )
+                record = cur.fetchone()
+
+                if not record:
+                    raise FinanceException(f"未找到提现单号 {out_request_no} 的记录")
+
+                # 状态映射
+                status_map = {
+                    "INIT": "初始态",
+                    "SUCCESS": "提现成功",
+                    "FAIL": "提现失败",
+                    "PROCESSING": "处理中"
+                }
+
+                result = {
+                    "out_request_no": record["out_request_no"],
+                    "withdraw_id": record["withdraw_id"],
+                    "amount": record["amount"],
+                    "amount_yuan": float(record["amount"]) / 100,
+                    "account_type": record["account_type"],
+                    "status": record["status"],
+                    "status_text": status_map.get(record["status"], record["status"]),
+                    "bank_memo": record["bank_memo"],
+                    "remark": record["remark"],
+                    "created_at": record["created_at"].strftime("%Y-%m-%d %H:%M:%S") if record["created_at"] else None,
+                    "updated_at": record["updated_at"].strftime("%Y-%m-%d %H:%M:%S") if record["updated_at"] else None,
+                }
+
+                if record["status"] == "FAIL" and record["fail_reason"]:
+                    result["fail_reason"] = record["fail_reason"]
+
+                return result
+
+    def list_merchant_withdraw_records(
+            self,
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            status: Optional[str] = None,
+            page: int = 1,
+            page_size: int = 20
+    ) -> Dict[str, Any]:
+        """
+        查询商户提现记录列表
+        ...
+        """
+        logger.info(f"查询商户提现记录列表: start_date={start_date}, end_date={end_date}, status={status}")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 构建查询条件
+                where_conditions = ["1=1"]
+                params = []
+
+                if start_date:
+                    where_conditions.append("DATE(created_at) >= %s")
+                    params.append(start_date)
+                if end_date:
+                    where_conditions.append("DATE(created_at) <= %s")
+                    params.append(end_date)
+                if status:
+                    where_conditions.append("status = %s")
+                    params.append(status)
+
+                where_sql = " AND ".join(where_conditions)
+
+                # 查询总数
+                cur.execute(
+                    f"SELECT COUNT(*) as total FROM merchant_withdraw_records WHERE {where_sql}",
+                    tuple(params)
+                )
+                total_count = cur.fetchone()["total"] or 0
+
+                # 查询明细
+                offset = (page - 1) * page_size
+                cur.execute(
+                    f"""SELECT * FROM merchant_withdraw_records 
+                        WHERE {where_sql}
+                        ORDER BY created_at DESC
+                        LIMIT %s OFFSET %s""",
+                    tuple(params + [page_size, offset])
+                )
+                records = cur.fetchall()
+
+                # 状态映射
+                status_map = {
+                    "INIT": "初始态",
+                    "SUCCESS": "提现成功",
+                    "FAIL": "提现失败",
+                    "PROCESSING": "处理中"
+                }
+
+                # 格式化记录
+                formatted_records = []
+                for r in records:
+                    formatted_records.append({
+                        "out_request_no": r["out_request_no"],
+                        "withdraw_id": r["withdraw_id"],
+                        "amount": r["amount"],
+                        "amount_yuan": float(r["amount"]) / 100,
+                        "account_type": r["account_type"],
+                        "status": r["status"],
+                        "status_text": status_map.get(r["status"], r["status"]),
+                        "bank_memo": r["bank_memo"],
+                        "remark": r["remark"],
+                        "fail_reason": r["fail_reason"],
+                        "created_at": r["created_at"].strftime("%Y-%m-%d %H:%M:%S") if r["created_at"] else None,
+                        "updated_at": r["updated_at"].strftime("%Y-%m-%d %H:%M:%S") if r["updated_at"] else None,
+                    })
+
+                # 汇总统计
+                cur.execute(
+                    f"""SELECT 
+                        COUNT(*) as total_count,
+                        SUM(CASE WHEN status = 'SUCCESS' THEN amount ELSE 0 END) as total_success_amount,
+                        SUM(CASE WHEN status = 'FAIL' THEN amount ELSE 0 END) as total_fail_amount,
+                        SUM(CASE WHEN status = 'INIT' THEN amount ELSE 0 END) as total_pending_amount
+                        FROM merchant_withdraw_records WHERE {where_sql}""",
+                    tuple(params)
+                )
+                summary = cur.fetchone()
+
+                return {
+                    "summary": {
+                        "total_records": summary["total_count"] or 0,
+                        "total_success_amount_yuan": float(summary["total_success_amount"] or 0) / 100,
+                        "total_fail_amount_yuan": float(summary["total_fail_amount"] or 0) / 100,
+                        "total_pending_amount_yuan": float(summary["total_pending_amount"] or 0) / 100,
+                    },
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total_count,
+                        "total_pages": (total_count + page_size - 1) // page_size if total_count > 0 else 1
+                    },
+                    "records": formatted_records
+                }
 # ==================== 订单系统财务功能（来自 order/finance.py） ====================
 
 def _build_team_rewards_select(cursor, asset_fields: List[str] = None) -> tuple:

@@ -733,6 +733,27 @@ class DatabaseManager:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
 
+            'merchant_withdraw_records': """
+            CREATE TABLE IF NOT EXISTS merchant_withdraw_records (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                out_request_no VARCHAR(32) UNIQUE NOT NULL COMMENT '商户提现单号',
+                withdraw_id VARCHAR(64) COMMENT '微信提现单号',
+                amount INT NOT NULL COMMENT '提现金额（单位：分）',
+                account_type VARCHAR(20) NOT NULL DEFAULT 'BASIC' COMMENT '出款账户类型：BASIC/OPERATION/FEES',
+                bank_memo VARCHAR(32) COMMENT '银行附言',
+                remark VARCHAR(56) COMMENT '提现备注',
+                status VARCHAR(20) NOT NULL DEFAULT 'INIT' COMMENT '状态：INIT/SUCCESS/FAIL/PROCESSING',
+                fail_reason VARCHAR(255) COMMENT '失败原因',
+                notify_url VARCHAR(256) COMMENT '通知地址',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_out_request_no (out_request_no),
+                INDEX idx_withdraw_id (withdraw_id),
+                INDEX idx_status (status),
+                INDEX idx_created_at (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+
             'store_logos': """
             CREATE TABLE IF NOT EXISTS store_logos (
                 id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'LOGO ID',
