@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, ConfigDict, AliasChoices, model_validator
 from typing import Optional, List, Dict, Any, cast
 from core.config import Settings, settings
 from core.database import get_conn
+from api.order.cart import resolve_sku, validate_quantity
 from services.finance_service import split_order_funds
 from core.config import VALID_PAY_WAYS, POINTS_DISCOUNT_RATE
 from core.table_access import build_dynamic_select, get_table_structure, _quote_identifier
@@ -44,46 +45,50 @@ EXPIRE_LOCK_MYSQL_NAME = "ds_order_expire_cancel"
 
 
 def _cancel_expire_orders_once() -> int:
-    """取消一批过期 pending_pay 订单，返回处理数量。"""
-    cancelled = 0
+    """失败订单保持原状并记录，健康订单独立提交。"""
+    now = datetime.now()
     with get_conn() as conn:
         with conn.cursor() as cur:
-            now = datetime.now()
             cur.execute(
-                """
-                SELECT id, order_number
-                FROM orders
-                WHERE status='pending_pay'
-                  AND expire_at IS NOT NULL
-                  AND expire_at <= %s
-                """,
+                "SELECT id, order_number FROM orders WHERE status='pending_pay' "
+                "AND expire_at IS NOT NULL AND expire_at <= %s ORDER BY id",
                 (now,),
             )
-            for o in cur.fetchall():
-                oid, ono = o["id"], o["order_number"]
-                cur.execute(
-                    "SELECT id FROM pending_rewards WHERE order_id = %s AND status = 'pending'",
-                    (oid,),
-                )
-                for reward in cur.fetchall():
-                    cur.execute("DELETE FROM pending_rewards WHERE id = %s", (reward["id"],))
-                    logger.info("删除订单 %s 待发放奖励 id=%s", ono, reward["id"])
-                cur.execute(
-                    "SELECT product_id,quantity FROM order_items WHERE order_id=%s",
-                    (oid,),
-                )
-                for it in cur.fetchall():
+            candidates = cur.fetchall()
+    cancelled = 0
+    for candidate in candidates:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE product_skus SET stock=stock+%s WHERE product_id=%s",
-                        (it["quantity"], it["product_id"]),
+                        "SELECT id, order_number FROM orders WHERE id=%s AND status='pending_pay' "
+                        "AND expire_at IS NOT NULL AND expire_at <= %s FOR UPDATE",
+                        (candidate["id"], now),
                     )
-                cur.execute(
-                    "UPDATE orders SET status='cancelled',updated_at=NOW() WHERE id=%s",
-                    (oid,),
-                )
-                cancelled += 1
-                logger.info("订单 %s 已自动取消（支付超时）", ono)
-            conn.commit()
+                    current = cur.fetchone()
+                    if not current:
+                        continue
+                    oid, ono = current["id"], current["order_number"]
+                    cur.execute(
+                        "SELECT product_id, sku_id, quantity FROM order_items WHERE order_id=%s ORDER BY sku_id",
+                        (oid,),
+                    )
+                    for item in cur.fetchall():
+                        validate_quantity(item["quantity"])
+                        sku_id = resolve_sku(cur, item["product_id"], item["sku_id"])
+                        cur.execute(
+                            "UPDATE product_skus SET stock=stock+%s WHERE id=%s AND product_id=%s",
+                            (item["quantity"], sku_id, item["product_id"]),
+                        )
+                        if cur.rowcount != 1:
+                            raise HTTPException(status_code=422, detail="历史 SKU 无法安全归还库存")
+                    cur.execute("DELETE FROM pending_rewards WHERE order_id=%s AND status='pending'", (oid,))
+                    cur.execute("UPDATE orders SET status='cancelled',updated_at=NOW() WHERE id=%s", (oid,))
+                    conn.commit()
+                    cancelled += 1
+                    logger.info("订单 %s 已自动取消（支付超时）", ono)
+        except Exception:
+            logger.exception("过期订单取消失败，保持原状待核查: order_id=%s", candidate["id"])
     return cancelled
 
 
@@ -192,6 +197,10 @@ class OrderManager:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
+                    # Lock the FK parent before SKU locks for both purchase modes.
+                    cur.execute("SELECT 1 FROM users WHERE id=%s FOR UPDATE", (user_id,))
+                    if not cur.fetchone():
+                        raise HTTPException(status_code=404, detail="用户不存在")
 
                     if not buy_now:
                         cur.execute("""
@@ -226,7 +235,8 @@ class OrderManager:
                         items = []
                         product_merchant_ids = set()
 
-                        for it in buy_now_items:
+                        for raw_item in buy_now_items:
+                            it = BuyNowItem.model_validate(raw_item).model_dump()
                             cur.execute("SELECT is_member_product, user_id, cash_only FROM products WHERE id = %s",
                                         (it["product_id"],))
                             prod = cur.fetchone()
@@ -236,26 +246,13 @@ class OrderManager:
 
                             product_merchant_ids.add(prod.get("user_id") or 0)
 
-                            sku_id = it.get("sku_id")
-                            if not sku_id:
-                                cur.execute("SELECT id FROM product_skus WHERE product_id = %s LIMIT 1",
-                                            (it['product_id'],))
-                                sku_row = cur.fetchone()
-                                if sku_row:
-                                    sku_id = sku_row.get('id')
-                                else:
-                                    raise HTTPException(status_code=422,
-                                                        detail=f"商品 {it['product_id']} 无可用 SKU，请提供 sku_id")
-
-                            if "price" not in it:
-                                raise HTTPException(status_code=422,
-                                                    detail=f"buy_now_items 必须包含 price 字段：product_id={it['product_id']}")
+                            sku_id = resolve_sku(cur, it["product_id"], it.get("sku_id"))
 
                             items.append({
                                 "sku_id": sku_id,
                                 "product_id": it["product_id"],
                                 "quantity": it["quantity"],
-                                "price": Decimal(str(it["price"])),
+                                "price": None,
                                 "is_vip": prod["is_member_product"],
                                 "cash_only": prod["cash_only"]  # 新增
                             })
@@ -273,15 +270,15 @@ class OrderManager:
                             SELECT c.product_id,
                                 c.sku_id,
                                 c.quantity,
-                                s.price,
+                                NULL AS price,
                                 p.is_member_product AS is_vip,
                                 p.user_id as merchant_id,
                                 c.specifications,
                                 p.cash_only
                             FROM cart c
-                            JOIN product_skus s ON s.id = c.sku_id
-                            JOIN products p ON p.id = c.product_id
+                            LEFT JOIN products p ON p.id = c.product_id
                             WHERE c.user_id = %s AND c.selected = 1
+                            ORDER BY c.id FOR UPDATE
                         """, (user_id,))
                         items = cur.fetchall()
                         if not items:
@@ -298,6 +295,30 @@ class OrderManager:
                             merchant_id = merchant_ids.pop() if merchant_ids else 0
 
                     merchant_id = int(merchant_id or 0)
+
+                    # Lock SKUs in one order across buyers, then price and reserve from the same rows.
+                    for item in items:
+                        validate_quantity(item["quantity"])
+                        item["sku_id"] = resolve_sku(cur, item["product_id"], item.get("sku_id"))
+                    for item in sorted(items, key=lambda item: item["sku_id"]):
+                        cur.execute(
+                            "SELECT price, stock FROM product_skus WHERE id=%s AND product_id=%s FOR UPDATE",
+                            (item["sku_id"], item["product_id"]),
+                        )
+                        sku = cur.fetchone()
+                        if not sku:
+                            raise HTTPException(status_code=422, detail="SKU 不存在或不属于该商品")
+                        price = Decimal(str(sku["price"]))
+                        if not price.is_finite() or price < 0:
+                            raise HTTPException(status_code=422, detail="SKU 价格配置无效")
+                        item["price"] = price
+                        cur.execute(
+                            "UPDATE product_skus SET stock = stock - %s "
+                            "WHERE id=%s AND product_id=%s AND stock >= %s",
+                            (item["quantity"], item["sku_id"], item["product_id"], item["quantity"]),
+                        )
+                        if cur.rowcount != 1:
+                            raise HTTPException(status_code=400, detail=f"SKU {item['sku_id']} 库存不足")
 
                     # ---------- 2. 优惠券商品类型验证（支持多张券叠加） ----------
                     has_vip = any(i["is_vip"] for i in items)
@@ -434,22 +455,6 @@ class OrderManager:
                     ))
                     oid = cur.lastrowid
 
-                    # ---------- 5. 库存校验 & 扣减 ----------
-                    structure = get_table_structure(cur, "product_skus")
-                    has_stock_field = 'stock' in structure['fields']
-                    stock_select = (
-                        f"COALESCE({_quote_identifier('stock')}, 0) AS {_quote_identifier('stock')}"
-                        if has_stock_field and 'stock' in structure['asset_fields']
-                        else _quote_identifier('stock')
-                    ) if has_stock_field else "0 AS stock"
-
-                    for i in items:
-                        cur.execute(f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE id=%s",
-                                    (i['sku_id'],))
-                        result = cur.fetchone()
-                        current_stock = result.get('stock', 0) if result else 0
-                        if current_stock < i["quantity"]:
-                            raise HTTPException(status_code=400, detail=f"SKU {i['sku_id']} 库存不足")
 
                     # ---------- 6. 写订单明细 ----------
                     for i in items:
@@ -461,11 +466,6 @@ class OrderManager:
                             i["price"], Decimal(str(i["quantity"])) * Decimal(str(i["price"]))
                         ))
 
-                    # ---------- 7. 扣库存 ----------
-                    if has_stock_field:
-                        for i in items:
-                            cur.execute("UPDATE product_skus SET stock = stock - %s WHERE id = %s",
-                                        (i["quantity"], i['sku_id']))
 
                     # ---------- 8. 清空购物车（仅购物车结算场景） ----------
                     if not buy_now:
@@ -1018,6 +1018,13 @@ class DeliveryWay(str, Enum):
     pickup = "pickup"
 
 
+class BuyNowItem(BaseModel):
+    product_id: int = Field(strict=True, gt=0)
+    sku_id: Optional[int] = Field(default=None, strict=True, gt=0)
+    quantity: int = Field(strict=True, ge=1, le=2147483647)
+    price: Optional[Decimal] = Field(default=None, description="兼容旧客户端；忽略此值，使用服务端 SKU 价格")
+
+
 class OrderCreate(BaseModel):
     """同时接受 snake_case 与小程序常用 camelCase 请求体字段。"""
 
@@ -1129,7 +1136,7 @@ class OrderCreate(BaseModel):
     )
     specifications: Optional[str] = None
     buy_now: bool = Field(default=False, validation_alias=AliasChoices("buy_now", "buyNow"))
-    buy_now_items: Optional[List[Dict[str, Any]]] = Field(
+    buy_now_items: Optional[List[BuyNowItem]] = Field(
         default=None,
         validation_alias=AliasChoices("buy_now_items", "buyNowItems"),
     )
@@ -1207,7 +1214,7 @@ def create_order(body: OrderCreate):
         body.custom_address,
         specifications=body.specifications,
         buy_now=body.buy_now,
-        buy_now_items=body.buy_now_items,
+        buy_now_items=[item.model_dump() for item in body.buy_now_items] if body.buy_now_items else None,
         delivery_way=body.delivery_way,
         points_to_use=body.points_to_use,
         coupon_id=body.coupon_id,

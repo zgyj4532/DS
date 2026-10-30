@@ -89,6 +89,7 @@ WECHAT_APP_SECRET=WECHAT_APP_SECRET
 
 - [业务接口文档与 V1.1 需求差异](docs/禹泽小程序接口文档.md)：区分当前接口与尚未实现的咯哒权益、白酒专区目标契约。
 - [msgSecCheck 与资料写入契约](docs/api/msg-sec-check.md)：微信 v2 仅明确 `pass` 放行；代理违规/异常仍返回 HTTP 200 + `pass=false`。资料修改必须登录并匹配本人，昵称写入端独立审核。
+- [购物车与订单 SKU/价格契约](docs/api/cart-order-security.md)：PR8 修订、MySQL 迁移与旧数据处理、隔离验证边界。
 - [安全与 WSL 测试报告](docs/禹泽项目安全与测试报告.md)：48 项回归通过及 HTTP 冒烟边界；仍有未修复的资金、权限、找回密码风险，不能据此宣称可安全上线。
 - [待完成事项](docs/待完成事项.md)：前端迁移、真实微信联调、业务确认与上线阻断问题。
 

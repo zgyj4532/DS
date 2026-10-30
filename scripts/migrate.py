@@ -71,11 +71,67 @@ def ensure_users_points_columns(dry_run: bool) -> None:
                 conn.commit()
 
 
+def ensure_cart_sku_key(dry_run: bool) -> None:
+    """Reject ambiguous legacy data before any irreversible DDL."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.id FROM cart c
+                LEFT JOIN product_skus s ON s.id=c.sku_id AND s.product_id=c.product_id
+                LEFT JOIN products p ON p.id=c.product_id
+                WHERE c.quantity IS NULL OR c.quantity <= 0 OR p.id IS NULL
+                   OR (c.sku_id IS NOT NULL AND s.id IS NULL)
+                   OR (c.sku_id IS NULL AND
+                       (SELECT COUNT(*) FROM product_skus x WHERE x.product_id=c.product_id) <> 1)
+                LIMIT 1
+            """)
+            invalid = cur.fetchone()
+            if invalid:
+                raise RuntimeError(f"cart id={invalid['id']} has invalid/ambiguous legacy SKU or quantity; reconcile before migration")
+            cur.execute("""
+                SELECT c.user_id, c.product_id,
+                       COALESCE(c.sku_id, (SELECT MIN(s.id) FROM product_skus s WHERE s.product_id=c.product_id)) AS resolved_sku,
+                       COUNT(*) AS n
+                FROM cart c GROUP BY c.user_id, c.product_id, resolved_sku
+                HAVING COUNT(*) > 1 LIMIT 1
+            """)
+            if cur.fetchone():
+                raise RuntimeError("cart contains duplicate user/product/SKU rows; reconcile quantities before migration")
+            cur.execute("SHOW INDEX FROM cart")
+            indexes = {}
+            for row in cur.fetchall():
+                if row["Non_unique"] == 0:
+                    indexes.setdefault(row["Key_name"], {})[row["Seq_in_index"]] = row["Column_name"]
+            columns = {name: [parts[pos] for pos in sorted(parts)] for name, parts in indexes.items()}
+            expected = ["user_id", "product_id", "sku_id"]
+            if "uk_user_product_sku" in columns and columns["uk_user_product_sku"] != expected:
+                raise RuntimeError("cart.uk_user_product_sku has unexpected columns; inspect schema")
+            statements = [
+                "UPDATE cart c JOIN product_skus s ON s.product_id=c.product_id SET c.sku_id=s.id WHERE c.sku_id IS NULL",
+                "ALTER TABLE cart MODIFY COLUMN sku_id BIGINT UNSIGNED NOT NULL, MODIFY COLUMN quantity INT NOT NULL DEFAULT 1",
+            ]
+            clauses = []
+            for name, cols in columns.items():
+                if cols == ["user_id", "product_id"]:
+                    clauses.append("DROP INDEX `" + name.replace("`", "``") + "`")
+            if expected not in columns.values():
+                clauses.append("ADD UNIQUE KEY uk_user_product_sku (user_id, product_id, sku_id)")
+            if clauses:
+                statements.append("ALTER TABLE cart " + ", ".join(clauses))
+            for stmt in statements:
+                logger.info("cart migration: %s", stmt)
+                if not dry_run:
+                    cur.execute(stmt)
+            if not dry_run:
+                conn.commit()
+
+
 def run_migrations(dry_run: bool = False) -> None:
     migrations_dir = ROOT / "migrations"
     for path in sorted(migrations_dir.glob("*.sql")):
         run_sql_file(path, dry_run)
     ensure_users_points_columns(dry_run)
+    ensure_cart_sku_key(dry_run)
     logger.info("迁移完成")
 
 

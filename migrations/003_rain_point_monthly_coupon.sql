@@ -1,6 +1,12 @@
 -- Monthly rain-point coupon policy. Run with scripts/migrate.py before enabling the scheduler.
-ALTER TABLE coupons
-    ADD COLUMN IF NOT EXISTS rain_settlement_id BIGINT UNSIGNED DEFAULT NULL COMMENT 'Monthly rain-point settlement ID';
+SET @rain_column_ddl = IF(
+    EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'coupons' AND column_name = 'rain_settlement_id'),
+    'SELECT 1',
+    'ALTER TABLE coupons ADD COLUMN rain_settlement_id BIGINT UNSIGNED DEFAULT NULL COMMENT ''Monthly rain-point settlement ID'''
+);
+PREPARE rain_column_stmt FROM @rain_column_ddl;
+EXECUTE rain_column_stmt;
+DEALLOCATE PREPARE rain_column_stmt;
 
 CREATE TABLE IF NOT EXISTS rain_point_monthly_settlements (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
