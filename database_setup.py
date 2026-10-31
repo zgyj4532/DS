@@ -375,9 +375,25 @@ class DatabaseManager:
                     valid_from DATE NOT NULL,
                     valid_to DATE NOT NULL,
                     used_at DATETIME DEFAULT NULL,
+                    rain_settlement_id BIGINT UNSIGNED DEFAULT NULL COMMENT '雨点月度转换台账ID',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_user_status (user_id, status),
                     INDEX idx_valid_to (valid_to)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            'rain_point_monthly_settlements': """
+                CREATE TABLE IF NOT EXISTS rain_point_monthly_settlements (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT UNSIGNED NOT NULL,
+                    settlement_period CHAR(7) NOT NULL COMMENT '结算月份，格式YYYY-MM',
+                    conversion_mode ENUM('excess','monthly') NOT NULL,
+                    rain_points_before DECIMAL(14,6) NOT NULL,
+                    converted_amount DECIMAL(14,6) NOT NULL DEFAULT 0,
+                    coupon_id BIGINT UNSIGNED DEFAULT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uk_user_period (user_id, settlement_period),
+                    INDEX idx_period (settlement_period),
+                    INDEX idx_coupon (coupon_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             'withdrawals': """
@@ -917,6 +933,7 @@ class DatabaseManager:
             'coupons': {
                 # 检查并添加 applicable_product_type 字段
                 'applicable_product_type': "applicable_product_type ENUM('all','normal_only','member_only') NOT NULL DEFAULT 'all' COMMENT '优惠券适用商品范围：all=不限制，normal_only=仅普通商品，member_only=仅会员商品'",
+                'rain_settlement_id': "rain_settlement_id BIGINT UNSIGNED DEFAULT NULL COMMENT '雨点月度转换台账ID'",
             },
             'products': {
                 'cover': "cover VARCHAR(500) NULL COMMENT '商品封面图'",

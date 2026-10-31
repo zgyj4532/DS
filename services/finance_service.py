@@ -36,6 +36,7 @@ from services.finance.discount_helpers import (
     parse_offline_coupon_ids,
     parse_pending_coupon_ids,
 )
+from services.finance.rain_point_policy import calculate_conversion
 
 logger = get_logger(__name__)
 
@@ -994,7 +995,7 @@ class FinanceService:
         3. 防止低层级用户获得高层级奖励（如L1用户拿L2奖励）
 
         业务规则：
-        - 会员商品直推奖励已关闭，仅发放团队奖励
+        - 推荐奖励：仅首次购买（0星→1星）且直接推荐人≥1星时发放
         - 团队奖励：只为新达到的层级发放，必须由≥目标层级的用户获得
         - 推荐奖励和团队奖励可同时发放，互不影响
         """
@@ -1015,8 +1016,57 @@ class FinanceService:
 
         total_distributed = Decimal('0')
 
-        # 1. 推荐奖励已关闭，仅发放团队奖励
-        logger.debug("直推奖励已取消，当前仅发放团队奖励")
+        # 1. 推荐奖励（首次购买 + 推荐人必须是星级会员）
+        if old_level == 0:  # 只有0星升1星时才发推荐奖励
+            cur.execute(
+                "SELECT referrer_id FROM user_referrals WHERE user_id = %s",
+                (buyer_id,)
+            )
+            referrer = cur.fetchone()
+
+            if referrer and referrer['referrer_id']:
+                cur.execute(
+                    "SELECT member_level FROM users WHERE id = %s",
+                    (referrer['referrer_id'],)
+                )
+                referrer_info = cur.fetchone()
+                referrer_level = referrer_info['member_level'] if referrer_info else 0
+
+                if referrer_level >= 1:
+                    reward_amount = single_price * self.get_direct_referral_reward_rate()
+
+                    # 发放到 referral_points
+                    cur.execute(
+                        "UPDATE users SET referral_points = COALESCE(referral_points, 0) + %s WHERE id = %s",
+                        (reward_amount, referrer['referrer_id'])
+                    )
+                    # 更新 true_total_points
+                    cur.execute(
+                        "UPDATE users SET true_total_points = true_total_points + %s WHERE id = %s",
+                        (reward_amount, referrer['referrer_id'])
+                    )
+
+                    # 记录流水
+                    cur.execute(
+                        "SELECT COALESCE(referral_points, 0) AS referral_points FROM users WHERE id = %s",
+                        (referrer['referrer_id'],)
+                    )
+                    new_balance = Decimal(str(cur.fetchone()['referral_points'] or 0))
+
+                    cur.execute(
+                        """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                           flow_type, remark, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
+                        ('referral_points', referrer['referrer_id'], reward_amount,
+                         new_balance, 'income', f"推荐奖励 - 订单#{order_id}")
+                    )
+
+                    logger.info(f"推荐奖励发放: 用户{referrer['referrer_id']}({referrer_level}星) +{reward_amount:.2f}")
+                    total_distributed += reward_amount
+                else:
+                    logger.debug(f"推荐人{referrer['referrer_id']}不是星级会员({referrer_level}星)，不发放推荐奖励")
+            else:
+                logger.debug("购买者无推荐人，跳过推荐奖励")
 
         # 2. 团队奖励（只为新达到的层级发放；0→1 也发放）
         if new_level <= old_level:
@@ -2768,7 +2818,7 @@ class FinanceService:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, user_id, amount FROM coupons
+                    SELECT id, user_id, amount, rain_settlement_id FROM coupons
                     WHERE status = %s AND valid_to < %s
                     ORDER BY id
                     """,
@@ -2789,11 +2839,12 @@ class FinanceService:
                     if cur.rowcount == 0:
                         continue
                     if amt > 0:
+                        destination_pool = 'director_pool' if r.get('rain_settlement_id') else 'subsidy_pool'
                         self._add_pool_balance(
                             cur,
-                            'subsidy_pool',
+                            destination_pool,
                             amt,
-                            f"优惠券#{cid}过期未使用，面额归入补贴池",
+                            f"优惠券#{cid}过期未使用，面额归入{destination_pool}",
                             related_user=uid,
                         )
                         cur.execute(
@@ -2817,6 +2868,89 @@ class FinanceService:
             total_amount,
         )
         return {"processed": processed, "total_amount": float(total_amount)}
+
+    def settle_monthly_rain_points(self, settlement_period: Optional[str] = None) -> Dict[str, Any]:
+        """Convert each member's rain-point balance once per month."""
+        from calendar import monthrange
+
+        period = settlement_period or datetime.now().strftime('%Y-%m')
+        try:
+            period_date = datetime.strptime(period, '%Y-%m').date()
+        except ValueError as exc:
+            raise FinanceException("settlement_period must use YYYY-MM") from exc
+        period_end = period_date.replace(day=monthrange(period_date.year, period_date.month)[1])
+
+        processed = 0
+        skipped = 0
+        total_converted = Decimal('0')
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM users WHERE status = 1 ORDER BY id")
+                for row in cur.fetchall() or []:
+                    user_id = int(row['id'])
+                    cur.execute(
+                        "SELECT id, true_total_points FROM users WHERE id = %s FOR UPDATE",
+                        (user_id,),
+                    )
+                    user = cur.fetchone()
+                    if not user:
+                        continue
+                    cur.execute(
+                        "SELECT id FROM rain_point_monthly_settlements WHERE user_id = %s AND settlement_period = %s",
+                        (user_id, period),
+                    )
+                    if cur.fetchone():
+                        skipped += 1
+                        continue
+
+                    balance = Decimal(str(user['true_total_points'] or 0))
+                    amount, mode = calculate_conversion(balance)
+
+                    cur.execute(
+                        """INSERT INTO rain_point_monthly_settlements
+                           (user_id, settlement_period, conversion_mode, rain_points_before, converted_amount)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (user_id, period, mode, balance, amount),
+                    )
+                    settlement_id = cur.lastrowid
+                    if amount <= 0:
+                        processed += 1
+                        continue
+
+                    new_balance = balance - amount
+                    cur.execute(
+                        "UPDATE users SET true_total_points = %s WHERE id = %s",
+                        (new_balance, user_id),
+                    )
+                    cur.execute(
+                        """INSERT INTO coupons
+                           (user_id, coupon_type, amount, applicable_product_type, valid_from, valid_to,
+                            status, rain_settlement_id)
+                           VALUES (%s, 'user', %s, 'all', %s, %s, 'unused', %s)""",
+                        (user_id, amount, period_date, period_end, settlement_id),
+                    )
+                    coupon_id = cur.lastrowid
+                    cur.execute(
+                        "UPDATE rain_point_monthly_settlements SET coupon_id = %s WHERE id = %s",
+                        (coupon_id, settlement_id),
+                    )
+                    cur.execute(
+                        """INSERT INTO account_flow
+                           (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+                           VALUES ('true_total_points', %s, %s, %s, 'expense', %s, NOW())""",
+                        (user_id, -amount, new_balance,
+                         f"rain point monthly conversion: {period}/{mode}/coupon={coupon_id}"),
+                    )
+                    processed += 1
+                    total_converted += amount
+                conn.commit()
+
+        return {
+            'settlement_period': period,
+            'processed': processed,
+            'skipped': skipped,
+            'total_converted': float(total_converted),
+        }
 
     # ----------------------------------
     # 供线下模块调用的快捷接口
@@ -6504,11 +6638,6 @@ class FinanceService:
                         change_amount = -abs(float(r['change_amount']))
                     else:
                         flow_type_label = flow_type_base_mapping.get(account_type, account_type)
-                        if (
-                            account_type == 'team_reward_points'
-                            and remark == '团队L3奖励（来自第3层）- 订单#1223'
-                        ):
-                            flow_type_label = '间推奖励收入'
                         flow_category = '支出' if account_type == 'true_total_points' else '收入'
                         change_amount = float(r['change_amount'])
 

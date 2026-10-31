@@ -109,6 +109,15 @@ class TaskScheduler:
             misfire_grace_time=3600
         )
 
+        self.scheduler.add_job(
+            self.settle_monthly_rain_points,
+            CronTrigger(day=1, hour=0, minute=5),
+            id="monthly_rain_point_coupon",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+
         # 每小时清理过期银行卡验证码
         self.scheduler.add_job(
             self.clean_expired_bankcard_codes,
@@ -188,6 +197,15 @@ class TaskScheduler:
 
         except Exception as e:
             logger.error(f"[定时任务] 联创分红发放异常: {str(e)}", exc_info=True)
+
+    def settle_monthly_rain_points(self):
+        """Run the monthly rain-point to coupon conversion."""
+        try:
+            from services.finance_service import FinanceService
+            result = FinanceService().settle_monthly_rain_points()
+            logger.info("[scheduled] monthly rain-point conversion completed: %s", result)
+        except Exception as e:
+            logger.error("[scheduled] monthly rain-point conversion failed: %s", e, exc_info=True)
 
     def shutdown(self):
         """关闭定时任务，并释放锁"""

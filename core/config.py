@@ -250,6 +250,8 @@ MAX_POINTS_VALUE: Final[Decimal] = Decimal('0.005')    # 正确：0.5%
 TAX_RATE: Final[Decimal] = Decimal('0.06')
 POINTS_DISCOUNT_RATE: Final[Decimal] = Decimal('1.0')
 COUPON_VALID_DAYS: Final[int] = 30
+RAIN_POINT_COUPON_BASE: Final[Decimal] = Decimal('330')
+RAIN_POINT_MONTHLY_COUPON: Final[Decimal] = Decimal('30')
 MAX_PURCHASE_PER_DAY: Final[int] = 2
 MAX_TEAM_LAYER: Final[int] = 10
 
